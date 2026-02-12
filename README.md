@@ -1,8 +1,8 @@
-# DA-ZDGAD: Dynamic Graph Zero-Shot Anomaly Detection via Temporal Consistency and Single Prototype Alignment
+# Prototype-Centric Learning for Zero-Shot Anomaly Detection in Dynamic Graphs
 
 ## Overview
 
-DA-ZDGAD (Dual-Alignment Zero-Shot Dynamic Graph Anomaly Detection) is a unified framework designed for anomaly node detection in dynamic graphs. This repository implements our research on addressing the dual challenges of label scarcity and continuous structural evolution in dynamic graph anomaly detection.
+ProtoDGAD (Prototype-Centric Dynamic Graph Anomaly Detection) is a unified framework designed for anomaly node detection in dynamic graphs. This repository implements our research on addressing the dual challenges of label scarcity and continuous structural evolution in dynamic graph anomaly detection.
 
 ![Framework Overview](docs/framework.png)
 
@@ -15,7 +15,7 @@ DA-ZDGAD (Dual-Alignment Zero-Shot Dynamic Graph Anomaly Detection) is a unified
 
 ## Method Introduction
 
-DA-ZDGAD is developed based on two core principles:
+ProtoDGAD is developed based on two core principles:
 
 1. **Self-Evolution Inconsistency**: Anomaly nodes' evolution directions are inconsistent with their historical self-evolution trajectories
 2. **Global Evolution Inconsistency**: Anomaly nodes are inconsistent with overall population evolution trends
@@ -66,8 +66,8 @@ zero_shot/
 
 ```bash
 # Clone the repository
-git clone https://github.com/YuTong-Cai2001/DA-ZDGAD.git
-cd DA-ZDGAD
+git clone https://github.com/YuTong-Cai2001/ProtoDGAD.git
+cd ProtoDGAD
 
 # Install dependencies
 pip install torch torch-geometric scipy numpy scikit-learn
