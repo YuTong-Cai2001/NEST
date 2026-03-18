@@ -1,8 +1,8 @@
-# Prototype-Centric Learning for Zero-Shot Anomaly Detection in Dynamic Graphs
+# Single-Prototype Learning for Zero-Shot Anomaly Detection in Dynamic Graphs
 
 ## Overview
 
-ProtoDGAD (Prototype-Centric Dynamic Graph Anomaly Detection) is a unified framework designed for anomaly node detection in dynamic graphs. This repository implements our research on addressing the dual challenges of label scarcity and continuous structural evolution in dynamic graph anomaly detection.
+SPAD (a Single-Prototype learning framework for zero-shot Anomaly Detection in dynamic graphs) is a unified framework designed for anomaly node detection in dynamic graphs. This repository implements our research on addressing the dual challenges of label scarcity and continuous structural evolution in dynamic graph anomaly detection.
 
 ![Framework Overview](docs/framework.png)
 
@@ -15,7 +15,7 @@ ProtoDGAD (Prototype-Centric Dynamic Graph Anomaly Detection) is a unified frame
 
 ## Method Introduction
 
-ProtoDGAD is developed based on two core principles:
+SPAD is developed based on two core principles:
 
 1. **Self-Evolution Inconsistency**: Anomaly nodes' evolution directions are inconsistent with their historical self-evolution trajectories
 2. **Global Evolution Inconsistency**: Anomaly nodes are inconsistent with overall population evolution trends
@@ -66,8 +66,8 @@ zero_shot/
 
 ```bash
 # Clone the repository
-git clone https://github.com/YuTong-Cai2001/ProtoDGAD.git
-cd ProtoDGAD
+git clone https://github.com/YuTong-Cai2001/SPAD.git
+cd SPAD
 
 # Install dependencies
 pip install torch torch-geometric scipy numpy scikit-learn
