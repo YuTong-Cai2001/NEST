@@ -421,16 +421,62 @@ class AnomalyGFMModel(nn.Module):
             hidden_dim=self.hidden_dim,
             output_dim=config['output_dim']
         )
-        
+
+        # The spatial memory projection must be registered before the optimizer is
+        # created.  The previous implementation created this layer lazily in
+        # forward(), so its parameters were neither optimized nor reliably loaded
+        # from checkpoints.
+        self.memory_projector = nn.Linear(
+            self.gnn_encoder.output_dim, self.feature_dim
+        )
+
+        self.prototype_mode = config.get('prototype_mode', 'single')
+        if self.prototype_mode not in {'single', 'dual'}:
+            raise ValueError(
+                f"prototype_mode must be 'single' or 'dual', got {self.prototype_mode!r}"
+            )
+
         self.normal_prototype = nn.Parameter(torch.randn(1, config['output_dim']))
-        self.abnormal_prototype = nn.Parameter(torch.randn(1, config['output_dim']))
-        
-        # Initialize prototype parameters
         nn.init.xavier_uniform_(self.normal_prototype)
-        nn.init.xavier_uniform_(self.abnormal_prototype)
-        
-        # NEW: Learnable temperature parameter for temperature-weighted softmax fusion
-        self.score_temperature = nn.Parameter(torch.tensor(5.0))
+
+        # The full SPAD model is strictly single-prototype.  A dual-prototype
+        # parameter is created only for the explicit ablation requested from the
+        # command line.
+        if self.prototype_mode == 'dual':
+            self.abnormal_prototype = nn.Parameter(
+                torch.randn(1, config['output_dim'])
+            )
+            nn.init.xavier_uniform_(self.abnormal_prototype)
+        else:
+            self.register_parameter('abnormal_prototype', None)
+
+        # Convert a cosine distance into a supervised binary logit.  Ranking
+        # metrics use the raw distance; BCE uses this calibrated logit.
+        self.score_scale_raw = nn.Parameter(
+            torch.tensor(float(config.get('score_scale_init', 5.0)))
+        )
+        self.score_threshold = nn.Parameter(
+            torch.tensor(float(config.get('score_threshold_init', 0.5)))
+        )
+        self.prototype_score_weight_raw = nn.Parameter(
+            torch.tensor(float(config.get('prototype_score_weight_init', 0.5)))
+        )
+        self.temporal_score_weight_raw = nn.Parameter(
+            torch.tensor(float(config.get('temporal_score_weight_init', -1.0)))
+        )
+        self.temporal_score_threshold = nn.Parameter(
+            torch.tensor(float(config.get('temporal_score_threshold_init', 0.0)))
+        )
+        self.use_consensus_prototype = bool(
+            config.get('use_consensus_prototype', True)
+        )
+        self.use_transport_residual = bool(
+            config.get('use_transport_residual', True)
+        )
+        self.consensus_ratio = float(config.get('consensus_ratio', 0.7))
+        self.attribute_descriptor_dim = int(
+            config.get('attribute_descriptor_dim', 16)
+        )
         
     def forward(self, temporal_sequences: torch.Tensor,
                 adjacency_matrices: Union[List[torch.Tensor], List[Dict]],
@@ -449,8 +495,11 @@ class AnomalyGFMModel(nn.Module):
         
         
         structural_evolution = self._compute_structural_evolution(adjacency_matrices)
-        temporal_input = temporal_sequences.view(-1, seq_len, feature_dim)  
-        temporal_input = temporal_input.permute(0, 2, 1)  
+        # [B, T, N, F] -> [B*N, F, T].  A direct view would mix the
+        # time and node axes in memory.
+        temporal_input = temporal_sequences.permute(0, 2, 1, 3).contiguous()
+        temporal_input = temporal_input.view(batch_size * num_nodes, seq_len, feature_dim)
+        temporal_input = temporal_input.permute(0, 2, 1)
         
         temporal_representations = self.tcn_encoder(temporal_input)  
         
@@ -468,33 +517,33 @@ class AnomalyGFMModel(nn.Module):
         spatial_projected = self.spatial_projection(spatial_representations)
         
         if seq_len >= 2:
-            h_temp_current = temporal_projected[:, -1]     # (batch_size, num_nodes, projection_dim)
-            h_temp_prev = temporal_projected[:, -2]        # (batch_size, num_nodes, projection_dim)
-            h_spatial_current = spatial_projected[:, -1]   # (batch_size, num_nodes, projection_dim)
-            h_spatial_prev = spatial_projected[:, -2]      # (batch_size, num_nodes, projection_dim)
-            
-            # Vectorized residual computation (process entire batch at once)
-            residual_features = self.residual_module(
-                h_temp_current, h_temp_prev,
-                h_spatial_current, h_spatial_prev
+            residual_changes = self.residual_module(
+                temporal_projected[:, 1:], temporal_projected[:, :-1],
+                spatial_projected[:, 1:], spatial_projected[:, :-1]
+            )
+            residual_sequence = torch.cat([
+                residual_changes.new_zeros(
+                    batch_size, 1, num_nodes, self.projection_dim
+                ),
+                residual_changes,
+            ], dim=1)
         else:
-            # If sequence length is insufficient, use zero residuals
-            residual_features = torch.zeros(batch_size, num_nodes, self.projection_dim, 
-                                          device=temporal_sequences.device)
-        
-        current_spatial = spatial_representations[:, -1]  # (batch_size, num_nodes, gnn_output_dim)
-        current_features = temporal_sequences[:, -1]      # (batch_size, num_nodes, feature_dim)
-        
-        # Vectorized fusion: directly concatenate and process on batch dimension
+            residual_sequence = torch.zeros(
+                batch_size, seq_len, num_nodes, self.projection_dim,
+                device=temporal_sequences.device,
+            )
+
+        # Build a fused representation at every time step.  The previous
+        # implementation fused only the last snapshot, so its temporal loss
+        # was applied to a different space than its anomaly score.
         combined_features = torch.cat([
-            residual_features,   # (batch_size, num_nodes, projection_dim)
-            current_spatial,     # (batch_size, num_nodes, gnn_output_dim)
-            current_features     # (batch_size, num_nodes, feature_dim)
-        ], dim=-1)  # (batch_size, num_nodes, total_feature_dim)
-        
-        # Fusion processing for entire batch at once
-        fused_representations = self.fusion_network(combined_features)  # (batch_size, num_nodes, output_dim)
-        
+            residual_sequence,
+            spatial_representations,
+            temporal_sequences,
+        ], dim=-1)
+        fused_sequence = self.fusion_network(combined_features)
+        fused_representations = fused_sequence.mean(dim=1)
+
         batch_size, num_nodes, feature_dim = fused_representations.shape
         representations_flat = fused_representations.view(-1, feature_dim)  # (batch_size * num_nodes, feature_dim)
         
@@ -502,115 +551,228 @@ class AnomalyGFMModel(nn.Module):
         representations_norm = F.normalize(representations_flat, p=2, dim=1)
         normal_prototype_norm = F.normalize(self.normal_prototype, p=2, dim=1)
 
-        abnormal_prototype_norm = F.normalize(self.abnormal_prototype, p=2, dim=1)
-        
-        sim_to_normal = torch.mm(representations_norm, normal_prototype_norm.t()).squeeze(1)
-        sim_to_abnormal = torch.mm(representations_norm, abnormal_prototype_norm.t()).squeeze(1)
-        
-        distance_scores_flat = 1 - sim_to_normal
-        
-        contrast_scores_flat = sim_to_abnormal - sim_to_normal
+        learned_sim_to_normal = torch.mm(
+            representations_norm, normal_prototype_norm.t()
+        ).squeeze(1)
+        learned_distance_scores_flat = 1 - learned_sim_to_normal
 
-        alpha = 0.6  
-        beta = 0.4   
-        anomaly_scores_flat = alpha * distance_scores_flat + beta * contrast_scores_flat
-        
-        margin_scores_flat = sim_to_abnormal - sim_to_normal
-        
+        normalized_fused_sequence = F.normalize(fused_sequence, p=2, dim=-1)
+        if seq_len >= 2:
+            temporal_volatility = torch.norm(
+                normalized_fused_sequence[:, 1:]
+                - normalized_fused_sequence[:, :-1],
+                dim=-1,
+            ).mean(dim=1)
+        else:
+            temporal_volatility = fused_representations.new_zeros(
+                batch_size, num_nodes
+            )
+        volatility_mean = temporal_volatility.mean(dim=1, keepdim=True)
+        volatility_std = temporal_volatility.std(
+            dim=1, keepdim=True, unbiased=False
+        ).clamp_min(1e-6)
+        temporal_volatility_z = (
+            temporal_volatility - volatility_mean
+        ) / volatility_std
+
+        # Robust unlabeled prototype transport at inference.  Target graph
+        # attributes live in a different semantic space, so directly reusing
+        # the source prototype can reverse the ranking direction.  Because
+        # anomalies are rare, low-volatility informative target nodes provide
+        # a label-free estimate of the target normal population center.
+        consensus_prototype = None
+        if (not self.training) and self.use_consensus_prototype:
+            normalized_by_batch = representations_norm.view(
+                batch_size, num_nodes, feature_dim
+            )
+            transported = []
+            attr_dim = min(
+                self.attribute_descriptor_dim, temporal_sequences.shape[-1]
+            )
+            for batch_idx in range(batch_size):
+                informative = torch.norm(
+                    temporal_sequences[batch_idx, -1, :, :attr_dim], dim=-1
+                ) > 1e-6
+                candidate_volatility = temporal_volatility[batch_idx][informative]
+                if candidate_volatility.numel() >= 2:
+                    cutoff = torch.quantile(
+                        candidate_volatility.detach(), self.consensus_ratio
+                    )
+                    reliable = informative & (
+                        temporal_volatility[batch_idx] <= cutoff
+                    )
+                else:
+                    reliable = informative
+                if reliable.sum() < 2:
+                    transported.append(normal_prototype_norm.squeeze(0))
+                else:
+                    transported.append(F.normalize(
+                        normalized_by_batch[batch_idx][reliable].mean(
+                            dim=0, keepdim=True
+                        ),
+                        p=2,
+                        dim=-1,
+                    ).squeeze(0))
+            consensus_prototype = torch.stack(transported, dim=0)
+            sim_to_normal_reshaped = torch.einsum(
+                'bnd,bd->bn', normalized_by_batch, consensus_prototype
+            )
+            sim_to_normal = sim_to_normal_reshaped.reshape(-1)
+        else:
+            sim_to_normal = learned_sim_to_normal
+
+        distance_scores_flat = 1 - sim_to_normal
+        # Directional prototype-transport residual.  A normal target node is
+        # expected to move with the normal population from the learned source
+        # centre toward the transported target centre.  A large positive value
+        # means that the node is relatively closer to the obsolete source
+        # normal direction while remaining far from the target normal centre.
+        # This score is label-free and contains no fitted target-side weight.
+        transport_residual_flat = (
+            distance_scores_flat - learned_distance_scores_flat
+        )
+
+        score_scale = F.softplus(self.score_scale_raw) + 1e-6
+        if self.prototype_mode == 'dual':
+            abnormal_prototype_norm = F.normalize(
+                self.abnormal_prototype, p=2, dim=1
+            )
+            sim_to_abnormal = torch.mm(
+                representations_norm, abnormal_prototype_norm.t()
+            ).squeeze(1)
+            anomaly_logits_flat = score_scale * (sim_to_abnormal - sim_to_normal)
+        elif consensus_prototype is not None:
+            # Directional Prototype-Transport Residual (DPTR).  Normal target
+            # nodes should follow the population shift from the learned source
+            # normal centre to the robust target normal centre.  Rank a node by
+            # how much farther it remains from the target centre than from the
+            # obsolete source centre.  This uses no target labels and no target-
+            # fitted mixing coefficient.  Temporal information still enters by
+            # selecting the reliable nodes that define the target centre.
+            sim_to_abnormal = None
+            if self.use_transport_residual:
+                anomaly_logits_flat = score_scale * transport_residual_flat
+            else:
+                # Explicit ablation: retain robust target-prototype transport
+                # but remove the directional source-to-target residual.
+                anomaly_logits_flat = score_scale * (
+                    distance_scores_flat - self.score_threshold
+                )
+        else:
+            sim_to_abnormal = None
+            prototype_weight = F.softplus(self.prototype_score_weight_raw)
+            temporal_weight = F.softplus(self.temporal_score_weight_raw)
+            anomaly_logits_flat = score_scale * (
+                prototype_weight * (
+                    distance_scores_flat - self.score_threshold
+                )
+                + temporal_weight * (
+                    temporal_volatility_z.reshape(-1)
+                    - self.temporal_score_threshold
+                )
+            )
+
+        anomaly_scores_flat = torch.sigmoid(anomaly_logits_flat)
 
         anomaly_scores = anomaly_scores_flat.view(batch_size, num_nodes)  # (batch_size, num_nodes)
+        anomaly_logits = anomaly_logits_flat.view(batch_size, num_nodes)
+        anomaly_distances = distance_scores_flat.view(batch_size, num_nodes)
         sim_to_normal_reshaped = sim_to_normal.view(batch_size, num_nodes)
-        sim_to_abnormal_reshaped = sim_to_abnormal.view(batch_size, num_nodes)
-        margin_scores = margin_scores_flat.view(batch_size, num_nodes)
-        
+        sim_to_abnormal_reshaped = (
+            sim_to_abnormal.view(batch_size, num_nodes)
+            if sim_to_abnormal is not None else None
+        )
 
         return {
             'fused_representations': fused_representations,
-            'anomaly_scores': anomaly_scores,  
-            'sim_to_normal': sim_to_normal_reshaped,      
-            'sim_to_abnormal': sim_to_abnormal_reshaped,  
-            'margin_scores': margin_scores,               
+            'anomaly_scores': anomaly_scores,
+            'anomaly_logits': anomaly_logits,
+            'anomaly_distances': anomaly_distances,
+            'learned_prototype_distances': learned_distance_scores_flat.view(
+                batch_size, num_nodes
+            ),
+            'prototype_transport_residual': transport_residual_flat.view(
+                batch_size, num_nodes
+            ),
+            'sim_to_normal': sim_to_normal_reshaped,
+            'sim_to_abnormal': sim_to_abnormal_reshaped,
             'temporal_representations': temporal_representations,
             'spatial_representations': spatial_representations,
             'temporal_projected': temporal_projected,
+            # Canonical [batch, time, node, feature] tensor used by L_self
+            # and representation regularization.  Including the projected
+            # spatial state is essential because DGraphFin node attributes are
+            # static while its snapshot adjacencies evolve over time.
+            'consistency_representations': fused_sequence,
             'spatial_projected': spatial_projected,
-            'residual_features': residual_features,
+            'residual_features': residual_sequence[:, -1],
+            'residual_sequence': residual_sequence,
+            'fused_sequence': fused_sequence,
+            'temporal_volatility': temporal_volatility,
+            'temporal_volatility_z': temporal_volatility_z,
             'normal_prototype': self.normal_prototype,
-            'abnormal_prototype': self.abnormal_prototype
+            'consensus_prototype': consensus_prototype,
+            'abnormal_prototype': self.abnormal_prototype,
+            'prototype_mode': self.prototype_mode,
         }
     
     def _compute_structural_evolution(self, adjacency_matrices: Union[List[torch.Tensor], List[Dict]]) -> Dict[str, torch.Tensor]:
         """
-        Compute graph structural evolution features - TGN key component
+        Compute normalized structural-change statistics without materializing
+        Python sets of every edge (which is prohibitive on million-edge graphs).
         """
         seq_len = len(adjacency_matrices)
-        
         if seq_len < 2:
-            # If only one timestep, return zero evolution
             return {'evolution_features': torch.zeros(1), 'has_evolution': False}
-        
-        edge_changes = []  # Record edge changes
-        degree_changes = []  # Record degree changes
-        
+
+        edge_changes = []
+        degree_changes = []
         for t in range(1, seq_len):
             prev_adj = adjacency_matrices[t-1]
             curr_adj = adjacency_matrices[t]
-            
-            # Extract edge_index (compatible with sparse dict and dense tensor)
             if isinstance(prev_adj, dict) and 'edge_index' in prev_adj:
                 prev_edges = prev_adj['edge_index']
                 curr_edges = curr_adj['edge_index']
+                num_nodes = int(max(
+                    prev_adj.get('num_nodes', 0), curr_adj.get('num_nodes', 0)
+                ))
             else:
-                # Handle dense tensor (backward compatibility)
                 prev_edges, _ = dense_to_sparse(prev_adj)
                 curr_edges, _ = dense_to_sparse(curr_adj)
-            
-            # Compute edge set changes
-            prev_edge_set = set(map(tuple, prev_edges.t().tolist()))
-            curr_edge_set = set(map(tuple, curr_edges.t().tolist()))
-            
-            # Count changes
-            new_edges = len(curr_edge_set - prev_edge_set)
-            removed_edges = len(prev_edge_set - curr_edge_set)
-            edge_changes.append([new_edges, removed_edges])
-            
-            # Compute degree distribution changes (memory-safe version) - Avoid CUDA bincount errors
-            try:
-                prev_max_node = prev_edges[0].max().item() if prev_edges[0].numel() > 0 else 0
-                curr_max_node = curr_edges[0].max().item() if curr_edges[0].numel() > 0 else 0
-                max_node_id = max(prev_max_node, curr_max_node)
-                
-                if max_node_id > 100000:  
-                    degree_change = abs(curr_edges[0].numel() - prev_edges[0].numel()) / 1000.0
-                else:
-                    prev_degrees = torch.bincount(prev_edges[0].clamp(0, max_node_id))
-                    curr_degrees = torch.bincount(curr_edges[0].clamp(0, max_node_id))
-                    
-                    max_len = max(len(prev_degrees), len(curr_degrees))
-                    if len(prev_degrees) < max_len:
-                        prev_degrees = F.pad(prev_degrees, (0, max_len - len(prev_degrees)))
-                    if len(curr_degrees) < max_len:
-                        curr_degrees = F.pad(curr_degrees, (0, max_len - len(curr_degrees)))
-                    
-                    degree_change = torch.norm(curr_degrees.float() - prev_degrees.float()).item()
-                    
-                degree_changes.append(degree_change)
-                
-            except Exception as e:
-                degree_changes.append(abs(curr_edges[0].numel() - prev_edges[0].numel()) / 1000.0)
-        
-        # Aggregate evolution features
+                num_nodes = int(max(prev_adj.shape[-1], curr_adj.shape[-1]))
+
+            prev_count = int(prev_edges.shape[1])
+            curr_count = int(curr_edges.shape[1])
+            denominator = max(prev_count, 1)
+            signed_change = (curr_count - prev_count) / denominator
+            edge_changes.append([
+                max(signed_change, 0.0), max(-signed_change, 0.0)
+            ])
+
+            if num_nodes > 0:
+                prev_degree = torch.bincount(
+                    prev_edges[0], minlength=num_nodes
+                ).float()
+                curr_degree = torch.bincount(
+                    curr_edges[0], minlength=num_nodes
+                ).float()
+                relative_degree_change = (
+                    (curr_degree - prev_degree).abs().mean()
+                    / (prev_degree.mean() + 1e-6)
+                )
+                degree_changes.append(float(relative_degree_change.item()))
+            else:
+                degree_changes.append(0.0)
+
         if edge_changes:
-            edge_evolution = torch.tensor(edge_changes).float()  # (seq_len-1, 2)
-            degree_evolution = torch.tensor(degree_changes).float()  # (seq_len-1,)
-            
+            edge_evolution = torch.tensor(edge_changes, dtype=torch.float32)
+            degree_evolution = torch.tensor(degree_changes, dtype=torch.float32)
             evolution_features = torch.cat([
-                edge_evolution.flatten(),  # Edge change features
-                degree_evolution          # Degree change features
+                edge_evolution.flatten(), degree_evolution
             ], dim=0)
         else:
-            evolution_features = torch.zeros(4)  # Default dimension
-        
+            evolution_features = torch.zeros(1)
+
         return {
             'evolution_features': evolution_features,
             'edge_changes': edge_changes,
@@ -671,9 +833,6 @@ class AnomalyGFMModel(nn.Module):
                 
                 if t > 0:
                     memory_features = node_memory[b]  # (num_nodes, gnn_output_dim)
-                    if not hasattr(self, 'memory_projector'):
-                        self.memory_projector = nn.Linear(gnn_output_dim, current_features.shape[-1]).to(current_features.device)
-                    
                     projected_memory = self.memory_projector(memory_features)
                     enhanced_features = current_features + projected_memory
                 else:
@@ -865,6 +1024,9 @@ def create_model_config(feature_dim: int, sequence_length: int) -> Dict:
         'dropout': 0.2,
         'projection_hidden_dim': 32,
         'temperature': 0.1,
+        'prototype_mode': 'single',
+        'score_scale_init': 5.0,
+        'score_threshold_init': 0.5,
     }
     
     return config

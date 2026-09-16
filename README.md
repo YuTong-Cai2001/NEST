@@ -1,8 +1,10 @@
-# Single-Prototype Learning for Zero-Shot Anomaly Detection in Dynamic Graphs
+# SPAD: Single-Prototype Adaptation for Dynamic Graph Anomaly Detection
+
+> The executable, repaired experiment instructions are in [RUNNING.md](RUNNING.md). The pipeline now defaults to a strict single normal prototype; `--prototype_mode dual` is reserved for the ablation.
 
 ## Overview
 
-SPAD (a Single-Prototype learning framework for zero-shot Anomaly Detection in dynamic graphs) is a unified framework designed for anomaly node detection in dynamic graphs. This repository implements our research on addressing the dual challenges of label scarcity and continuous structural evolution in dynamic graph anomaly detection.
+SPAD is a framework for zero-shot and few-shot anomalous-node detection in dynamic graphs. It combines normal-population alignment with temporal consistency learned from source-domain dynamic graphs.
 
 ![Framework Overview](docs/framework.png)
 
@@ -12,6 +14,7 @@ SPAD (a Single-Prototype learning framework for zero-shot Anomaly Detection in d
 - **Few-Shot Fine-tuning**: Supports rapid adaptation to target domains through sparse annotations
 - **Temporal Modeling**: Explicitly captures temporal dependencies and structural evolution patterns
 - **Dual-Alignment Mechanism**: Combines self-evolution inconsistency modeling with population-level alignment
+- **Directional Prototype-Transport Residual**: Scores nodes that fail to follow the label-free source-to-target normal-population shift
 
 ## Method Introduction
 
@@ -23,6 +26,8 @@ SPAD is developed based on two core principles:
 The framework explicitly models these principles through:
 - **Temporal Consistency Constraints**: Captures self-evolution inconsistency
 - **Single-Prototype Population Alignment**: Characterizes global evolution inconsistency
+- **Robust Target Prototype Transport**: Estimates the target normal centre from informative, temporally stable majority nodes
+- **Directional Transport Residual**: Uses `d_target - d_source` as the zero-shot anomaly ranking score, without target labels or a target-fitted mixing weight
 
 This approach learns transferable discriminative priors under source domain supervision, enabling effective zero-shot transfer to target domains.
 
@@ -30,25 +35,28 @@ This approach learns transferable discriminative priors under source domain supe
 
 | Setting | AUC | AP |
 |---------|-----|-----|
-| Zero-Shot (DGraphFin → FiGraph) | 0.9537 | 0.0180 |
-| Few-Shot Fine-tuning (DGraphFin → FiGraph) | 0.965 | 0.0180 |
+| Zero-Shot engineering check (DGraphFin → FiGraph, seed 42) | 0.7654 | 0.0843 |
 
-*Results on real-world financial datasets (DGraphFin and FiGraph)*
+*Verified end-to-end from the final inference path using a 50-epoch seed-42
+run. Report multi-seed mean and standard deviation in the paper after
+the complete experiment launcher finishes; the old unverified 0.9537/0.0180
+placeholder has been removed.*
 
 ## Project Structure
 
 ```
-zero_shot/
-├── anomaly_gfm_complete_model.py    # Main model architecture (AnomalyGFM Temporal GNN)
+ProtoDGAD/
+├── anomaly_gfm_complete_model.py    # SPAD temporal graph model
 ├── data_processor.py                # Data loading and preprocessing
 ├── few_shot_finetune.py            # Few-shot fine-tuning implementation
 ├── model_adapter.py                # Sparse graph model adapter
 ├── sparse_graph_utils.py           # Sparse graph processing utilities
 ├── train_anomaly_gfm.py            # Main training script (zero-shot)
 ├── utils.py                        # Utility functions
-├── cache/                          # Cache directory
-├── checkpoints/                    # Model checkpoints
-└── processed_data/                # Processed datasets
+├── plot_results.py                 # CSV aggregation and paper figures
+├── run_experiments.ps1             # Reproducible experiment launcher
+├── results/                        # Raw and aggregated CSV results
+└── outputs/                        # Checkpoints and fitted feature aligners
 ```
 
 ## Installation
@@ -65,12 +73,9 @@ zero_shot/
 ### Setup
 
 ```bash
-# Clone the repository
-git clone https://github.com/YuTong-Cai2001/SPAD.git
-cd SPAD
-
-# Install dependencies
-pip install torch torch-geometric scipy numpy scikit-learn
+# From the ProtoDGAD directory, after installing a CUDA-compatible PyTorch build
+pip install -r requirements.txt
+python smoke_test.py
 ```
 
 ## Datasets
@@ -93,7 +98,7 @@ FiGraph is another financial dataset with different feature dimensions (772 dime
 Run zero-shot anomaly detection from DGraphFin (source) to FiGraph (target):
 
 ```bash
-python zero_shot/train_anomaly_gfm.py --mode dynamic --start_year 2018 --end_year 2022 --epochs 100
+python train_anomaly_gfm.py --mode dynamic --start_year 2018 --end_year 2022 --epochs 50 --batch_size 1 --seed 42 --method_version dipt --run_name spad_dipt_full_seed42
 ```
 
 **Parameters:**
@@ -107,7 +112,7 @@ python zero_shot/train_anomaly_gfm.py --mode dynamic --start_year 2018 --end_yea
 Fine-tune the pre-trained model on target domain with sparse annotations:
 
 ```bash
-python zero_shot/few_shot_finetune.py
+python few_shot_finetune.py --model_path outputs/spad_full_seed42/checkpoints/best_source_loss.pth --seed 42
 ```
 
 This script will:
@@ -123,7 +128,7 @@ The `AnomalyGFMModel` implements:
 - **TemporalConvNet**: Temporal convolution for sequence processing
 - **GraphNeuralNetwork**: Graph structure encoding with residual connections
 - **HierarchicalFusionNetwork**: Multi-level feature fusion
-- **Dual Alignment**: Temporal consistency and prototype alignment
+- **Dual Alignment**: Temporal consistency and single-normal-prototype alignment
 
 ### Feature Alignment
 

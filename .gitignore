@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+
+cache/
+processed_data/
+outputs/
+checkpoints/
+data/
+
+results/zero_shot_runs.csv
+results/few_shot_runs.csv
+results/*_summary.csv
+figures/generated/
