@@ -38,12 +38,25 @@ class AnomalyGFMDataProcessor:
         
         self.target_dim = config.get('target_dim', 128)         
         self.use_svd = config.get('use_svd', True)              
+        self.alignment_mode = config.get('alignment_mode', 'invariant')
         
         self.dgraphfin_path = config.get('dgraphfin_path', 'data/DGraphFin2/')
         self.figraph_path = config.get('figraph_path', 'data/FiGraph-main/data/')
         
         self.cache_dir = config.get('cache_dir', 'cache/')
         self.enable_cache = config.get('enable_cache', True)
+        self.random_state = int(config.get('seed', 42))
+
+        # Fitted once and reused for every target snapshot.  Re-fitting SVD for
+        # each year creates unrelated coordinate systems and destroys temporal
+        # comparability.
+        self.source_reducer = None
+        self.target_reducer = None
+        self.source_scaler = None
+        self.target_scaler = None
+        self.source_descriptor_scaler = None
+        self.target_descriptor_scaler = None
+        self.feature_aligner_fitted = False
         
         if self.enable_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -65,6 +78,7 @@ class AnomalyGFMDataProcessor:
             Cache key string
         """
         cache_data = {
+            'cache_version': 2,
             'operation': operation,
             'temporal_window': self.temporal_window,
             'sequence_length': self.sequence_length,
@@ -247,8 +261,18 @@ class AnomalyGFMDataProcessor:
         edges_df = pd.read_csv(edges_file, header=None)
         edges_df.columns = ['source', 'target', 'edge_type']
 
-        first_row_values = edges_df.iloc[0].astype(str).values
-        if any(not v.isdigit() for v in first_row_values[:2]):
+        # FiGraph uses valid alphanumeric IDs such as U222540 and L300347.
+        # The old digit-only check mistook the first real edge for a header and
+        # silently dropped it in every year.
+        first_row_values = [
+            str(value).strip().lower() for value in edges_df.iloc[0].values
+        ]
+        source_headers = {'source', 'src', 'from', 'source_id', 'sourceid'}
+        target_headers = {'target', 'dst', 'to', 'target_id', 'targetid'}
+        if (
+            first_row_values[0] in source_headers
+            and first_row_values[1] in target_headers
+        ):
             edges_df = pd.read_csv(edges_file, skiprows=1, header=None)
             edges_df.columns = ['source', 'target', 'edge_type']
 
@@ -269,12 +293,8 @@ class AnomalyGFMDataProcessor:
         edges_df['target'] = edges_df['target'].astype(int)
         
 
-        num_zero_source = (edges_df['source'] == 0).sum()
-        num_zero_target = (edges_df['target'] == 0).sum()
-        if num_zero_source > 0 or num_zero_target > 0:
-            invalid_mask = (edges_df['source'] == 0) | (edges_df['target'] == 0)
-            edges_df = edges_df[~invalid_mask]
-
+        # Index 0 is a valid zero-based node index.  The previous code removed
+        # every edge incident to that node.
         edges_df = edges_df[(edges_df['source'] >= 0) & (edges_df['target'] >= 0)]
 
         if len(edges_df) == 0:
@@ -288,6 +308,9 @@ class AnomalyGFMDataProcessor:
         if 'nodeID' in features_df.columns:
             
             feature_node_ids = features_df['nodeID'].tolist()
+            feature_row_by_id = {
+                feature_id: idx for idx, feature_id in enumerate(feature_node_ids)
+            }
             
             max_node_id = max(node_to_int.values()) if node_to_int else -1
             aligned_features = []
@@ -300,11 +323,7 @@ class AnomalyGFMDataProcessor:
                 original_node_id = int_to_node[node_idx]
                 
                 # Find corresponding node in feature file
-                feature_row_idx = None
-                for idx, fid in enumerate(feature_node_ids):
-                    if fid == original_node_id:
-                        feature_row_idx = idx
-                        break
+                feature_row_idx = feature_row_by_id.get(original_node_id)
                 
                 if feature_row_idx is not None:
                     # Found corresponding features
@@ -318,9 +337,9 @@ class AnomalyGFMDataProcessor:
                     zero_row = pd.Series([0] * len(features_df.columns), index=features_df.columns)
                     zero_row['nodeID'] = original_node_id
                     zero_row['Year'] = year
-                    zero_row['Label'] = 0
+                    zero_row['Label'] = -1
                     aligned_features.append(zero_row)
-                    aligned_labels.append(0)
+                    aligned_labels.append(-1)
             
             # Reconstruct feature DataFrame
             features_df = pd.DataFrame(aligned_features)
@@ -386,36 +405,55 @@ class AnomalyGFMDataProcessor:
         all_edge_types = set()
         
         for year_data in yearly_data.values():
-            all_nodes.update(range(year_data['num_nodes']))
+            all_nodes.update(year_data['node_id_mapping'].keys())
             all_edge_types.update(year_data['edge_types'])
         
-        total_nodes = len(all_nodes)
+        # A single global mapping is essential: local index i from two
+        # independently loaded years does not necessarily identify the same
+        # company.
+        global_node_ids = sorted(all_nodes, key=lambda value: str(value))
+        global_node_to_int = {
+            node_id: idx for idx, node_id in enumerate(global_node_ids)
+        }
+        total_nodes = len(global_node_ids)
         feature_dim = next(iter(yearly_data.values()))['feature_dim']
         
         
         temporal_sequence = []       
         temporal_adjacencies = []    
         temporal_labels = []         
+        temporal_presence_masks = []
         valid_timestamps = []
         
         for year in available_years:
             year_data = yearly_data[year]
             
-            year_features = year_data['node_features']
-            year_labels = year_data['labels'] if year_data['labels'] is not None else np.zeros(year_data['num_nodes'])
-            
-            if year_data['num_nodes'] < total_nodes:
-                padded_features = np.zeros((total_nodes, feature_dim), dtype=np.float32)
-                padded_labels = np.zeros(total_nodes, dtype=np.float32)
-                
-                padded_features[:year_data['num_nodes']] = year_features
-                padded_labels[:year_data['num_nodes']] = year_labels
-                
-                year_features = padded_features
-                year_labels = padded_labels
-            elif year_data['num_nodes'] > total_nodes:
-                year_features = year_features[:total_nodes]
-                year_labels = year_labels[:total_nodes]
+            local_features = year_data['node_features']
+            local_labels = (
+                year_data['labels'] if year_data['labels'] is not None
+                else np.full(year_data['num_nodes'], -1, dtype=np.float32)
+            )
+            local_to_raw = {
+                local_idx: raw_id
+                for raw_id, local_idx in year_data['node_id_mapping'].items()
+            }
+
+            year_features = np.zeros(
+                (total_nodes, feature_dim), dtype=np.float32
+            )
+            # -1 marks nodes without a valid label in that snapshot.  They are
+            # excluded from evaluation instead of being counted as normal.
+            year_labels = np.full(total_nodes, -1, dtype=np.float32)
+            presence_mask = np.zeros(total_nodes, dtype=bool)
+
+            for local_idx, raw_id in local_to_raw.items():
+                if local_idx >= len(local_features):
+                    continue
+                global_idx = global_node_to_int[raw_id]
+                year_features[global_idx] = local_features[local_idx]
+                if local_idx < len(local_labels):
+                    year_labels[global_idx] = local_labels[local_idx]
+                presence_mask[global_idx] = True
             
             # Build adjacency matrix
             edges_df = year_data['edges']
@@ -425,7 +463,13 @@ class AnomalyGFMDataProcessor:
             edge_type_weights = {edge_type: 1.0 for edge_type in all_edge_types}  # Adjustable weights
             
             for _, row in edges_df.iterrows():
-                src, tgt, edge_type = row['source'], row['target'], row['edge_type']
+                src_local = int(row['source'])
+                tgt_local = int(row['target'])
+                if src_local not in local_to_raw or tgt_local not in local_to_raw:
+                    continue
+                src = global_node_to_int[local_to_raw[src_local]]
+                tgt = global_node_to_int[local_to_raw[tgt_local]]
+                edge_type = row['edge_type']
                 
                 if 0 <= src < total_nodes and 0 <= tgt < total_nodes:
                     weight = edge_type_weights.get(edge_type, 1.0)
@@ -444,6 +488,7 @@ class AnomalyGFMDataProcessor:
             temporal_sequence.append(year_features)
             temporal_adjacencies.append(adj_normalized)
             temporal_labels.append(year_labels)
+            temporal_presence_masks.append(presence_mask)
             valid_timestamps.append(f"FiGraph-{year}")
             
         edge_counts = [adj.nnz for adj in temporal_adjacencies]
@@ -453,11 +498,14 @@ class AnomalyGFMDataProcessor:
             'temporal_sequences': [temporal_sequence],     
             'temporal_adjacencies': [temporal_adjacencies],
             'temporal_labels': [temporal_labels],          
+            'temporal_presence_masks': [temporal_presence_masks],
             'valid_timestamps': [f"FiGraph-dynamic-{start_year}-{end_year}"],
             'available_years': available_years,
             'sequence_length': len(available_years),
             'num_nodes': total_nodes,
             'feature_dim': feature_dim,
+            'global_node_ids': global_node_ids,
+            'global_node_to_int': global_node_to_int,
             'edge_evolution_stats': {
                 'min_edges': min(edge_counts),
                 'max_edges': max(edge_counts), 
@@ -673,11 +721,13 @@ class AnomalyGFMDataProcessor:
 
         original_num_nodes = num_nodes  
         node_mapping = None  
+        selected_node_ids = np.arange(num_nodes, dtype=np.int64)
         
         if num_nodes > max_nodes:
             print(f"\n  Number of nodes ({num_nodes:,}) exceeds safety limit ({max_nodes:,})")
             
             important_nodes = self._select_important_nodes(dgraphfin_data, max_nodes)
+            selected_node_ids = np.asarray(important_nodes, dtype=np.int64)
             
             node_mapping = {old_id: new_id for new_id, old_id in enumerate(important_nodes)}
             
@@ -822,7 +872,8 @@ class AnomalyGFMDataProcessor:
             'sequence_length': len(temporal_sequence),
             'valid_timestamps': [[snap['window_id'] for snap in temporal_sequence]],
             'memory_optimized': True,  # Mark as memory-optimized version
-            'subsampled': num_nodes < dgraphfin_data.get('original_num_nodes', num_nodes)  # Whether downsampled
+            'subsampled': num_nodes < dgraphfin_data.get('original_num_nodes', num_nodes),
+            'selected_node_ids': selected_node_ids,
         }
         
         print(f"\n Save lightweight temporal sequences to cache...")
@@ -833,7 +884,284 @@ class AnomalyGFMDataProcessor:
         
         return result
 
-    def align_features(self, source_features: np.ndarray, 
+    @staticmethod
+    def _pad_features(features: np.ndarray, target_dim: int) -> np.ndarray:
+        if features.shape[1] >= target_dim:
+            return features
+        padding = np.zeros(
+            (features.shape[0], target_dim - features.shape[1]),
+            dtype=features.dtype,
+        )
+        return np.hstack([features, padding])
+
+    @staticmethod
+    def _valid_feature_rows(features: np.ndarray) -> np.ndarray:
+        finite = np.isfinite(features)
+        return finite.any(axis=1) & np.any(
+            np.where(finite, features, 0.0) != 0.0, axis=1
+        )
+
+    @staticmethod
+    def _fit_nonzero_scaler(features: np.ndarray) -> StandardScaler:
+        valid_rows = AnomalyGFMDataProcessor._valid_feature_rows(features)
+        if not valid_rows.any():
+            raise ValueError('Cannot fit invariant descriptors on all-zero features')
+        clean = np.nan_to_num(
+            features[valid_rows], nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32, copy=False)
+        return StandardScaler().fit(clean)
+
+    @staticmethod
+    def _distribution_descriptors(
+        features: np.ndarray, raw_scaler: StandardScaler,
+        descriptor_scaler: Optional[StandardScaler] = None,
+        fit_descriptor_scaler: bool = False,
+        chunk_size: int = 20000,
+    ) -> Tuple[np.ndarray, StandardScaler]:
+        """Convert arbitrary-dimensional attributes into semantic statistics.
+
+        Each output coordinate has the same meaning in every domain (mean
+        standardized activation, energy, tail mass, sparsity, etc.), unlike
+        independently fitted PCA/SVD coordinates.
+        """
+        valid_rows = AnomalyGFMDataProcessor._valid_feature_rows(features)
+        descriptor_dim = 16
+        descriptors = np.zeros(
+            (features.shape[0], descriptor_dim), dtype=np.float32
+        )
+
+        valid_indices = np.flatnonzero(valid_rows)
+        for start in range(0, len(valid_indices), chunk_size):
+            indices = valid_indices[start:start + chunk_size]
+            raw = np.nan_to_num(
+                features[indices], nan=0.0, posinf=0.0, neginf=0.0
+            ).astype(np.float32, copy=False)
+            z = raw_scaler.transform(raw).astype(np.float32, copy=False)
+            z = np.clip(z, -8.0, 8.0)
+            abs_z = np.abs(z)
+            width = max(z.shape[1], 1)
+            top_count = max(1, int(np.ceil(width * 0.05)))
+            top_abs = np.partition(
+                abs_z, kth=width - top_count, axis=1
+            )[:, -top_count:].mean(axis=1)
+            nonzero_fraction = (raw != 0).mean(axis=1)
+
+            descriptors[indices] = np.column_stack([
+                z.mean(axis=1),
+                z.std(axis=1),
+                abs_z.mean(axis=1),
+                np.sqrt(np.mean(z * z, axis=1) + 1e-8),
+                z.min(axis=1),
+                z.max(axis=1),
+                abs_z.max(axis=1),
+                (z > 0).mean(axis=1),
+                (z < 0).mean(axis=1),
+                (abs_z > 1).mean(axis=1),
+                (abs_z > 2).mean(axis=1),
+                (abs_z > 3).mean(axis=1),
+                nonzero_fraction,
+                np.mean(np.clip(z, -4, 4) ** 3, axis=1),
+                np.mean(np.clip(z, -4, 4) ** 4, axis=1),
+                top_abs,
+            ]).astype(np.float32)
+
+        if fit_descriptor_scaler:
+            descriptor_scaler = StandardScaler().fit(descriptors[valid_rows])
+        if descriptor_scaler is None:
+            raise RuntimeError('Descriptor scaler is not fitted')
+        descriptors[valid_rows] = np.clip(
+            descriptor_scaler.transform(descriptors[valid_rows]), -8.0, 8.0
+        ).astype(np.float32)
+        return descriptors, descriptor_scaler
+
+    @staticmethod
+    def structural_temporal_descriptors(
+        adjacency_sequence: List[sp.csr_matrix],
+    ) -> List[np.ndarray]:
+        """Create eight domain-invariant topology/evolution coordinates."""
+        binary_sequence = []
+        degrees = []
+        for adjacency in adjacency_sequence:
+            binary = adjacency.tocsr(copy=True)
+            binary.data = np.ones_like(binary.data, dtype=np.float32)
+            binary.setdiag(0)
+            binary.eliminate_zeros()
+            binary_sequence.append(binary)
+            degrees.append(np.asarray(binary.sum(axis=1)).ravel().astype(np.float32))
+
+        outputs = []
+        previous_degree = np.zeros_like(degrees[0])
+        previous_binary = None
+        previous_delta = np.zeros_like(degrees[0])
+        for binary, degree in zip(binary_sequence, degrees):
+            log_degree = np.log1p(degree)
+            neighbor_sum = np.asarray(binary.dot(log_degree)).ravel()
+            neighbor_mean = neighbor_sum / np.maximum(degree, 1.0)
+            delta = log_degree - np.log1p(previous_degree)
+
+            if previous_binary is None:
+                churn = np.zeros_like(degree)
+                new_ratio = (degree > 0).astype(np.float32)
+                lost_ratio = np.zeros_like(degree)
+            else:
+                intersection = np.asarray(
+                    previous_binary.multiply(binary).sum(axis=1)
+                ).ravel().astype(np.float32)
+                union = previous_degree + degree - intersection
+                churn = 1.0 - intersection / np.maximum(union, 1.0)
+                new_ratio = (degree - intersection) / np.maximum(degree, 1.0)
+                lost_ratio = (
+                    (previous_degree - intersection)
+                    / np.maximum(previous_degree, 1.0)
+                )
+
+            raw = np.column_stack([
+                log_degree,
+                neighbor_mean,
+                log_degree - neighbor_mean,
+                delta,
+                np.abs(delta),
+                churn,
+                new_ratio,
+                lost_ratio + np.abs(delta - previous_delta),
+            ]).astype(np.float32)
+            active = (degree > 0) | (previous_degree > 0)
+            normalized = np.zeros_like(raw)
+            if active.any():
+                normalized[active] = np.clip(
+                    StandardScaler().fit_transform(raw[active]), -8.0, 8.0
+                ).astype(np.float32)
+            outputs.append(normalized)
+            previous_degree = degree
+            previous_binary = binary
+            previous_delta = delta
+        return outputs
+
+    def append_structural_temporal_features(
+        self, feature_sequence: List[np.ndarray],
+        adjacency_sequence: List[sp.csr_matrix],
+    ) -> List[np.ndarray]:
+        structural = self.structural_temporal_descriptors(adjacency_sequence)
+        if len(feature_sequence) != len(structural):
+            raise ValueError('Feature and adjacency sequence lengths do not match')
+        return [
+            np.concatenate([features, structure], axis=1).astype(np.float32)
+            for features, structure in zip(feature_sequence, structural)
+        ]
+
+    def fit_feature_aligner(self, source_features: np.ndarray,
+                            target_features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Fit deterministic source/target transforms once."""
+        if self.alignment_mode == 'invariant':
+            self.source_scaler = self._fit_nonzero_scaler(source_features)
+            self.target_scaler = self._fit_nonzero_scaler(target_features)
+            source_reduced, self.source_descriptor_scaler = (
+                self._distribution_descriptors(
+                    source_features,
+                    self.source_scaler,
+                    fit_descriptor_scaler=True,
+                )
+            )
+            target_reduced, self.target_descriptor_scaler = (
+                self._distribution_descriptors(
+                    target_features,
+                    self.target_scaler,
+                    fit_descriptor_scaler=True,
+                )
+            )
+            self.target_dim = source_reduced.shape[1]
+            self.feature_aligner_fitted = True
+            return source_reduced, target_reduced
+
+        source_dim = source_features.shape[1]
+        target_dim = target_features.shape[1]
+
+        if source_dim > self.target_dim:
+            self.source_reducer = TruncatedSVD(
+                n_components=self.target_dim,
+                random_state=self.random_state,
+            )
+            source_reduced = self.source_reducer.fit_transform(source_features)
+        else:
+            source_reduced = self._pad_features(source_features, self.target_dim)
+
+        if target_dim > self.target_dim:
+            self.target_reducer = TruncatedSVD(
+                n_components=self.target_dim,
+                random_state=self.random_state,
+            )
+            target_reduced = self.target_reducer.fit_transform(target_features)
+        else:
+            target_reduced = self._pad_features(target_features, self.target_dim)
+
+        self.source_scaler = StandardScaler().fit(source_reduced)
+        self.target_scaler = StandardScaler().fit(target_reduced)
+        self.feature_aligner_fitted = True
+        return (
+            self.source_scaler.transform(source_reduced).astype(np.float32),
+            self.target_scaler.transform(target_reduced).astype(np.float32),
+        )
+
+    def transform_source_features(self, features: np.ndarray) -> np.ndarray:
+        if not self.feature_aligner_fitted:
+            raise RuntimeError('Feature aligner has not been fitted')
+        if self.alignment_mode == 'invariant':
+            transformed, _ = self._distribution_descriptors(
+                features, self.source_scaler, self.source_descriptor_scaler
+            )
+            return transformed
+        reduced = (
+            self.source_reducer.transform(features)
+            if self.source_reducer is not None
+            else self._pad_features(features, self.target_dim)
+        )
+        return self.source_scaler.transform(reduced).astype(np.float32)
+
+    def transform_target_features(self, features: np.ndarray) -> np.ndarray:
+        if not self.feature_aligner_fitted:
+            raise RuntimeError('Feature aligner has not been fitted')
+        if self.alignment_mode == 'invariant':
+            transformed, _ = self._distribution_descriptors(
+                features, self.target_scaler, self.target_descriptor_scaler
+            )
+            return transformed
+        reduced = (
+            self.target_reducer.transform(features)
+            if self.target_reducer is not None
+            else self._pad_features(features, self.target_dim)
+        )
+        return self.target_scaler.transform(reduced).astype(np.float32)
+
+    def save_feature_aligner(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as handle:
+            pickle.dump({
+                'target_dim': self.target_dim,
+                'alignment_mode': self.alignment_mode,
+                'source_reducer': self.source_reducer,
+                'target_reducer': self.target_reducer,
+                'source_scaler': self.source_scaler,
+                'target_scaler': self.target_scaler,
+                'source_descriptor_scaler': self.source_descriptor_scaler,
+                'target_descriptor_scaler': self.target_descriptor_scaler,
+                'random_state': self.random_state,
+            }, handle)
+
+    def load_feature_aligner(self, path: str):
+        with open(path, 'rb') as handle:
+            state = pickle.load(handle)
+        self.target_dim = state['target_dim']
+        self.alignment_mode = state.get('alignment_mode', 'svd')
+        self.source_reducer = state['source_reducer']
+        self.target_reducer = state['target_reducer']
+        self.source_scaler = state['source_scaler']
+        self.target_scaler = state['target_scaler']
+        self.source_descriptor_scaler = state.get('source_descriptor_scaler')
+        self.target_descriptor_scaler = state.get('target_descriptor_scaler')
+        self.random_state = state.get('random_state', self.random_state)
+        self.feature_aligner_fitted = True
+
+    def align_features(self, source_features: np.ndarray,
                       target_features: np.ndarray,
                       method: str = 'linear') -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -851,52 +1179,9 @@ class AnomalyGFMDataProcessor:
         print(f"   - Source features: {source_features.shape}")
         print(f"   - Target features: {target_features.shape}")
         
-        source_dim = source_features.shape[1]
-        target_dim = target_features.shape[1]
-        
-        if method == 'linear':
-            if source_dim < self.target_dim:
-                padding = np.random.normal(0, 0.1, 
-                                         (source_features.shape[0], 
-                                          self.target_dim - source_dim))
-                source_aligned = np.hstack([source_features, padding])
-            else:
-                projection_matrix = np.random.normal(0, 1, (source_dim, self.target_dim))
-                source_aligned = source_features @ projection_matrix
-                
-            if target_dim > self.target_dim:
-                if self.use_svd:
-                    svd = TruncatedSVD(n_components=self.target_dim)
-                    target_aligned = svd.fit_transform(target_features)
-                else:
-                    projection_matrix = np.random.normal(0, 1, (target_dim, self.target_dim))
-                    target_aligned = target_features @ projection_matrix
-            else:
-                target_aligned = target_features
-                
-        elif method == 'svd':
-            svd_source = TruncatedSVD(n_components=min(self.target_dim, source_dim))
-            svd_target = TruncatedSVD(n_components=min(self.target_dim, target_dim))
-            
-            source_aligned = svd_source.fit_transform(source_features)
-            target_aligned = svd_target.fit_transform(target_features)
-            
-            if source_aligned.shape[1] < self.target_dim:
-                padding = np.zeros((source_aligned.shape[0], 
-                                  self.target_dim - source_aligned.shape[1]))
-                source_aligned = np.hstack([source_aligned, padding])
-                
-            if target_aligned.shape[1] < self.target_dim:
-                padding = np.zeros((target_aligned.shape[0], 
-                                  self.target_dim - target_aligned.shape[1]))
-                target_aligned = np.hstack([target_aligned, padding])
-        
-        # Standardization
-        scaler_source = StandardScaler()
-        scaler_target = StandardScaler()
-        
-        source_aligned = scaler_source.fit_transform(source_aligned)
-        target_aligned = scaler_target.fit_transform(target_aligned)
+        source_aligned, target_aligned = self.fit_feature_aligner(
+            source_features, target_features
+        )
         
         print(f"    Aligned dimensions: Source {source_aligned.shape}, Target {target_aligned.shape}")
         
@@ -1127,7 +1412,7 @@ def test_data_processor():
     # Save data
     processor.save_processed_data(
         zero_shot_data, 
-        'zero_shot/processed_data/anomalygfm_zero_shot_2014.pkl'
+        'processed_data/anomalygfm_zero_shot_2014.pkl'
     )
     
 

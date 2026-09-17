@@ -1,0 +1,4 @@
+﻿run_name,stage,method_version,prototype_mode,seed,start_year,end_year,lambda_self,lambda_proto,lambda_reg,auc,ap,checkpoint
+spad_full_seed42,zero_shot,,single,42,2018,2022,0.5,0.3,0.1,0.6091068596850872,0.033478224269539496,D:\第二篇\TAI_LaTex_Template\ProtoDGAD\outputs\spad_full_seed42\checkpoints\best_source_loss.pth
+spad_di2_full_seed42,zero_shot,di2,single,42,2018,2022,0.5,0.3,0.1,0.6448668818890226,0.04800471911195277,D:\第二篇\TAI_LaTex_Template\ProtoDGAD\outputs\spad_di2_full_seed42\checkpoints\best_source_loss.pth
+spad_dipt_full_seed42,zero_shot,dipt,single,42,2018,2022,0.5,0.3,0.1,0.7881910122754652,0.1083799521916077,D:\第二篇\TAI_LaTex_Template\ProtoDGAD\outputs\spad_dipt_full_seed42\checkpoints\best_source_loss.pth
