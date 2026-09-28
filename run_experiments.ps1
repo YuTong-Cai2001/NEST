@@ -5,7 +5,7 @@ param(
     [int]$StartYear = 2018,
     [int]$EndYear = 2022,
     [string]$RunPrefix = "spad_dipt",
-    [string]$Variants = "full,no_self,no_proto,no_reg,no_transport,no_local,dual",
+    [string]$Variants = "full,svd_alignment,no_descriptors,no_residual,no_self,no_proto,dual",
     [string]$ResultsCsv = "results/zero_shot_runs.csv",
     [switch]$SkipFewShot,
     [switch]$DryRun
@@ -46,7 +46,7 @@ function Invoke-CheckedPython {
 $seedValues = @($Seeds.Split(',') | ForEach-Object { [int]$_.Trim() })
 $variantValues = @($Variants.Split(',') | ForEach-Object { $_.Trim() })
 $validVariants = @(
-    "full", "no_self", "no_proto", "no_reg", "no_transport", "no_local",
+    "full", "no_self", "no_proto", "no_transport", "no_local",
     "svd_alignment", "no_descriptors", "no_residual", "dual"
 )
 $unknownVariants = @($variantValues | Where-Object { $_ -notin $validVariants })
@@ -81,11 +81,6 @@ foreach ($seed in $seedValues) {
     if ($variantValues -contains "no_proto") {
         Invoke-CheckedPython -Arguments ($common + @(
             "--run_name", "$($RunPrefix)_no_proto_seed$seed", "--lambda_proto", "0"
-        ))
-    }
-    if ($variantValues -contains "no_reg") {
-        Invoke-CheckedPython -Arguments ($common + @(
-            "--run_name", "$($RunPrefix)_no_reg_seed$seed", "--lambda_reg", "0"
         ))
     }
     if ($variantValues -contains "no_transport") {

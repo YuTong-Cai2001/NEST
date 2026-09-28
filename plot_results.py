@@ -35,7 +35,7 @@ def plot_zero_shot_comparison(
         (zero_shot['prototype_mode'] == 'single')
         & (zero_shot['lambda_self'] > 0)
         & (zero_shot['lambda_proto'] > 0)
-        & (zero_shot['lambda_reg'] > 0)
+        & zero_shot['run_name'].astype(str).str.contains('_full_seed', na=False)
     ] if not zero_shot.empty else pd.DataFrame()
 
     # Prefer the final domain-invariant prototype-transport implementation
@@ -116,8 +116,6 @@ def variant_label(row: pd.Series) -> str:
         return 'w/o temporal consistency'
     if row['lambda_proto'] == 0:
         return 'w/o prototype alignment'
-    if row['lambda_reg'] == 0:
-        return 'w/o representation reg.'
     return 'SPAD full'
 
 
@@ -143,7 +141,6 @@ def plot_ablation(zero_shot: pd.DataFrame, output_dir: Path):
         'SPAD full',
         'w/o temporal consistency',
         'w/o prototype alignment',
-        'w/o representation reg.',
         'w/o transport residual',
         'w/o local evolution',
         'Dual prototype',

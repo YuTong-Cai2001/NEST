@@ -151,9 +151,8 @@ To enable cross-domain transfer between DGraphFin (17-dim) and FiGraph (772-dim)
 
 ### Loss Functions
 
-- **Prototype Contrastive Loss**: Learns discriminative prototypes
+- **Normal-Prototype Compactness Loss**: Concentrates normal-node representations around a transferable one-class prototype
 - **Temporal Consistency Loss**: Ensures smooth temporal evolution
-- **Residual Regularization**: Promotes representation diversity
 
 ## Main Contributions
 

@@ -55,10 +55,10 @@ To produce both the full zero-shot result and its few-shot result, omit
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run_experiments.ps1 -Seeds 42 -Epochs 50 -Variants full
 ```
 
-Then add the four ablations without rerunning the full model:
+Then add the six retained paper-facing ablations without rerunning the full model:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_experiments.ps1 -Seeds 42 -Epochs 50 -Variants no_self,no_proto,no_reg,no_transport,no_local,dual -SkipFewShot
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_experiments.ps1 -Seeds 42 -Epochs 50 -Variants svd_alignment,no_descriptors,no_residual,no_self,no_proto,dual -SkipFewShot
 ```
 
 If time permits, repeat the complete set for three seeds:
@@ -67,7 +67,7 @@ If time permits, repeat the complete set for three seeds:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run_experiments.ps1 -Seeds 42,43,44 -Epochs 50
 ```
 
-The default script runs the full model, three loss ablations, the dual-prototype ablation, few-shot fine-tuning of the full model, and figure generation. `-Variants` lets you stage that work.
+The default script runs the full model, the six retained component/design ablations, few-shot fine-tuning of the full model, and figure generation. `-Variants` lets you stage that work. The `no_transport` and `no_local` switches remain available for diagnostic scoring studies but are not part of the paper-facing component table.
 
 The strengthened full model is saved under the `spad_dipt_*` prefix and uses
 the `dipt` method-version tag.  This keeps its CSV rows and checkpoints

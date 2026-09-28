@@ -266,10 +266,7 @@ class AnomalyGFMTrainer:
         self.anomaly_weight = config.get('anomaly_weight', 1.0)
         self.lambda_self = float(config.get('lambda_self', 0.5))
         self.lambda_proto = float(config.get('lambda_proto', 0.3))
-        self.lambda_reg = float(config.get('lambda_reg', 0.1))
-        self.alpha_decorr = float(config.get('alpha_decorr', 0.1))
         self.temporal_margin = float(config.get('temporal_margin', 0.15))
-        self.variance_floor = float(config.get('variance_floor', 0.08))
         
         self.sparse_processor = SparseGraphProcessor(device=str(self.device))
         
@@ -814,7 +811,6 @@ class AnomalyGFMTrainer:
                 'anomaly_loss': train_metrics.get('anomaly_loss', 0.0),
                 'prototype_loss': train_metrics.get('prototype_loss', 0.0),
                 'consistency_loss': train_metrics.get('consistency_loss', 0.0),
-                'residual_loss': train_metrics.get('residual_loss', 0.0),
                 'unsupervised_loss': train_metrics.get('unsupervised_loss', 0.0),
                 'auc': eval_metrics.get('auc', 0.0),
                 'ap': eval_metrics.get('ap', 0.0),
@@ -834,7 +830,6 @@ class AnomalyGFMTrainer:
                 print(f"      - Contrastive Loss: {train_metrics.get('contrastive_loss', 0.0):.4f}")
                 print(f"      - Prototype Loss: {train_metrics.get('prototype_loss', 0.0):.4f}")
                 print(f"      - Consistency Loss: {train_metrics.get('consistency_loss', 0.0):.4f}")
-                print(f"      - Residual Loss: {train_metrics.get('residual_loss', 0.0):.4f}")
             else:
                 # Output simplified loss info every 5 epochs
                 if epoch % 5 == 0:
@@ -875,7 +870,6 @@ class AnomalyGFMTrainer:
             'end_year': self.config.get('end_year', ''),
             'lambda_self': self.lambda_self,
             'lambda_proto': self.lambda_proto,
-            'lambda_reg': self.lambda_reg,
             'auc': final_auc,
             'ap': final_ap,
             'evaluation_protocol': eval_metrics.get(
@@ -923,7 +917,6 @@ class AnomalyGFMTrainer:
         epoch_contrastive_loss = 0.0
         epoch_prototype_loss = 0.0
         epoch_consistency_loss = 0.0
-        epoch_residual_loss = 0.0
         consistency_series = []
         
         print(f"   Starting Sparse Format Training Loop...")
@@ -1049,18 +1042,12 @@ class AnomalyGFMTrainer:
                             'value': batch_consistency_loss
                         })
                         
-                        # Compute residual regularization loss (law 2)
-                        residual_loss = self._compute_residual_regularization_loss(
-                            consistency_representations
-                        )
-                        batch_residual_loss = residual_loss.item()
-                        
-                        # Five loss function combination: core loss + regularization losses
+                        # Final SPAD objective: supervised anomaly detection,
+                        # normal-prototype compactness and temporal consistency.
                         total_loss = (
                             anomaly_loss
                             + self.lambda_proto * prototype_loss
                             + self.lambda_self * consistency_loss
-                            + self.lambda_reg * residual_loss
                         )
                     else:
                         # No valid labels, skip this batch
@@ -1078,14 +1065,12 @@ class AnomalyGFMTrainer:
                 epoch_contrastive_loss += batch_contrastive_loss
                 epoch_prototype_loss += batch_prototype_loss
                 epoch_consistency_loss += batch_consistency_loss
-                epoch_residual_loss += batch_residual_loss
                 num_batches += 1
                 
                 if batch_idx % 10 == 0:
                     print(f"      Batch {batch_idx}: Total Loss={total_loss.item():.4f} | "
                           f"Anomaly={batch_anomaly_loss:.4f} | Contrastive={batch_contrastive_loss:.4f} | "
-                          f"Prototype={batch_prototype_loss:.4f} | Consistency={batch_consistency_loss:.4f} | "
-                          f"Residual={batch_residual_loss:.4f}")
+                          f"Prototype={batch_prototype_loss:.4f} | Consistency={batch_consistency_loss:.4f}")
                 
                 del temporal_batch, adjacency_lists, timestamps_batch
                 if labels_batch is not None:
@@ -1112,7 +1097,6 @@ class AnomalyGFMTrainer:
         avg_contrastive_loss = epoch_contrastive_loss / max(num_batches, 1)
         avg_prototype_loss = epoch_prototype_loss / max(num_batches, 1)
         avg_consistency_loss = epoch_consistency_loss / max(num_batches, 1)
-        avg_residual_loss = epoch_residual_loss / max(num_batches, 1)
         
         clear_gpu_memory()
         
@@ -1123,7 +1107,6 @@ class AnomalyGFMTrainer:
             'contrastive_loss': avg_contrastive_loss,
             'prototype_loss': avg_prototype_loss,
             'consistency_loss': avg_consistency_loss,
-            'residual_loss': avg_residual_loss,
             'consistency_series': consistency_series
         }
     
@@ -1161,31 +1144,6 @@ class AnomalyGFMTrainer:
                 return normal_smoothness
         return node_volatility.mean()
     
-    def _compute_residual_regularization_loss(
-        self, temporal_representations: torch.Tensor
-    ) -> torch.Tensor:
-        """Temporal intensity stability plus feature decorrelation."""
-        if temporal_representations.dim() != 4:
-            raise ValueError(
-                'Representation regularization expects [batch, time, node, feature]'
-            )
-
-        # VICReg-style variance floor prevents the temporal/prototype losses
-        # from satisfying their objectives by mapping every node to a constant.
-        feature_dim = temporal_representations.shape[-1]
-        flat_repr = temporal_representations.reshape(-1, feature_dim)
-        centered = flat_repr - flat_repr.mean(dim=0, keepdim=True)
-        feature_std = torch.sqrt(
-            centered.var(dim=0, unbiased=False) + 1e-4
-        )
-        variance_loss = F.relu(self.variance_floor - feature_std).mean()
-        denominator = max(flat_repr.shape[0] - 1, 1)
-        covariance = centered.t().matmul(centered) / denominator
-        off_diagonal = covariance - torch.diag(torch.diag(covariance))
-        decorrelation = off_diagonal.pow(2).mean()
-        return variance_loss + self.alpha_decorr * decorrelation
-
-
 def main():
     parser = argparse.ArgumentParser(description='SPAD zero-shot dynamic graph training')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
@@ -1204,10 +1162,7 @@ def main():
     parser.add_argument('--disable_residual_fusion', action='store_true')
     parser.add_argument('--lambda_self', type=float, default=0.5)
     parser.add_argument('--lambda_proto', type=float, default=0.3)
-    parser.add_argument('--lambda_reg', type=float, default=0.1)
-    parser.add_argument('--alpha_decorr', type=float, default=0.1)
     parser.add_argument('--temporal_margin', type=float, default=0.15)
-    parser.add_argument('--variance_floor', type=float, default=0.08)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--run_name', type=str, default='spad_full_seed42')
     parser.add_argument('--output_dir', type=str, default=None)
@@ -1235,10 +1190,7 @@ def main():
         'method_version': args.method_version,
         'lambda_self': args.lambda_self,
         'lambda_proto': args.lambda_proto,
-        'lambda_reg': args.lambda_reg,
-        'alpha_decorr': args.alpha_decorr,
         'temporal_margin': args.temporal_margin,
-        'variance_floor': args.variance_floor,
         'use_structural_temporal_descriptors': not args.disable_structural_temporal_descriptors,
         'seed': args.seed,
         'run_name': args.run_name,
