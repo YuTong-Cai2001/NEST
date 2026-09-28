@@ -381,22 +381,23 @@ class AnomalyGFMTrainer:
 
         # Step 4: append topology/evolution coordinates whose semantics are
         # identical in both domains (degree context, temporal change and edge
-        # churn).  This replaces dimension-only alignment with actual shared
-        # cross-domain descriptors.
-        for batch_idx in range(len(dgraphfin_temporal['temporal_sequences'])):
-            dgraphfin_temporal['temporal_sequences'][batch_idx] = (
-                processor.append_structural_temporal_features(
-                    dgraphfin_temporal['temporal_sequences'][batch_idx],
-                    dgraphfin_temporal['temporal_adjacencies'][batch_idx],
+        # churn).  The explicit switch is used only by the component ablation;
+        # the full model keeps these descriptors enabled.
+        if self.config.get('use_structural_temporal_descriptors', True):
+            for batch_idx in range(len(dgraphfin_temporal['temporal_sequences'])):
+                dgraphfin_temporal['temporal_sequences'][batch_idx] = (
+                    processor.append_structural_temporal_features(
+                        dgraphfin_temporal['temporal_sequences'][batch_idx],
+                        dgraphfin_temporal['temporal_adjacencies'][batch_idx],
+                    )
                 )
-            )
-        for batch_idx in range(len(figraph_temporal['temporal_sequences'])):
-            figraph_temporal['temporal_sequences'][batch_idx] = (
-                processor.append_structural_temporal_features(
-                    figraph_temporal['temporal_sequences'][batch_idx],
-                    figraph_temporal['temporal_adjacencies'][batch_idx],
+            for batch_idx in range(len(figraph_temporal['temporal_sequences'])):
+                figraph_temporal['temporal_sequences'][batch_idx] = (
+                    processor.append_structural_temporal_features(
+                        figraph_temporal['temporal_sequences'][batch_idx],
+                        figraph_temporal['temporal_adjacencies'][batch_idx],
+                    )
                 )
-            )
 
         self.feature_dim = dgraphfin_temporal['temporal_sequences'][0][0].shape[1]
         dgraphfin_temporal['feature_dim'] = self.feature_dim
@@ -1199,6 +1200,8 @@ def main():
     parser.add_argument('--method_version', type=str, default='dipt')
     parser.add_argument('--disable_transport_residual', action='store_true')
     parser.add_argument('--disable_local_fusion', action='store_true')
+    parser.add_argument('--disable_structural_temporal_descriptors', action='store_true')
+    parser.add_argument('--disable_residual_fusion', action='store_true')
     parser.add_argument('--lambda_self', type=float, default=0.5)
     parser.add_argument('--lambda_proto', type=float, default=0.3)
     parser.add_argument('--lambda_reg', type=float, default=0.1)
@@ -1236,6 +1239,7 @@ def main():
         'alpha_decorr': args.alpha_decorr,
         'temporal_margin': args.temporal_margin,
         'variance_floor': args.variance_floor,
+        'use_structural_temporal_descriptors': not args.disable_structural_temporal_descriptors,
         'seed': args.seed,
         'run_name': args.run_name,
         'output_dir': args.output_dir or os.path.join('outputs', args.run_name),
@@ -1250,6 +1254,7 @@ def main():
             'temperature': 0.1,
             'use_transport_residual': not args.disable_transport_residual,
             'use_local_evolution_score': not args.disable_local_fusion,
+            'use_residual_fusion': not args.disable_residual_fusion,
         }
     }
     

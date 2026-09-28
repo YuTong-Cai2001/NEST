@@ -6,6 +6,7 @@ param(
     [int]$EndYear = 2022,
     [string]$RunPrefix = "spad_dipt",
     [string]$Variants = "full,no_self,no_proto,no_reg,no_transport,no_local,dual",
+    [string]$ResultsCsv = "results/zero_shot_runs.csv",
     [switch]$SkipFewShot,
     [switch]$DryRun
 )
@@ -44,7 +45,10 @@ function Invoke-CheckedPython {
 
 $seedValues = @($Seeds.Split(',') | ForEach-Object { [int]$_.Trim() })
 $variantValues = @($Variants.Split(',') | ForEach-Object { $_.Trim() })
-$validVariants = @("full", "no_self", "no_proto", "no_reg", "no_transport", "no_local", "dual")
+$validVariants = @(
+    "full", "no_self", "no_proto", "no_reg", "no_transport", "no_local",
+    "svd_alignment", "no_descriptors", "no_residual", "dual"
+)
 $unknownVariants = @($variantValues | Where-Object { $_ -notin $validVariants })
 if ($unknownVariants.Count -gt 0) {
     throw "Unknown variants: $($unknownVariants -join ', ')"
@@ -60,7 +64,8 @@ foreach ($seed in $seedValues) {
         "--start_year", "$StartYear",
         "--end_year", "$EndYear",
         "--seed", "$seed",
-        "--method_version", "dipt"
+        "--method_version", "dipt",
+        "--results_csv", $ResultsCsv
     )
 
     if ($variantValues -contains "full") {
@@ -91,6 +96,21 @@ foreach ($seed in $seedValues) {
     if ($variantValues -contains "no_local") {
         Invoke-CheckedPython -Arguments ($common + @(
             "--run_name", "$($RunPrefix)_no_local_seed$seed", "--disable_local_fusion"
+        ))
+    }
+    if ($variantValues -contains "svd_alignment") {
+        Invoke-CheckedPython -Arguments ($common + @(
+            "--run_name", "$($RunPrefix)_svd_alignment_seed$seed", "--alignment_mode", "svd"
+        ))
+    }
+    if ($variantValues -contains "no_descriptors") {
+        Invoke-CheckedPython -Arguments ($common + @(
+            "--run_name", "$($RunPrefix)_no_descriptors_seed$seed", "--disable_structural_temporal_descriptors"
+        ))
+    }
+    if ($variantValues -contains "no_residual") {
+        Invoke-CheckedPython -Arguments ($common + @(
+            "--run_name", "$($RunPrefix)_no_residual_seed$seed", "--disable_residual_fusion"
         ))
     }
     if ($variantValues -contains "dual") {

@@ -479,6 +479,9 @@ class AnomalyGFMModel(nn.Module):
                 config.get('use_global_local_fusion', True),
             )
         )
+        self.use_residual_fusion = bool(
+            config.get('use_residual_fusion', True)
+        )
         self.consensus_ratio = float(config.get('consensus_ratio', 0.7))
         self.attribute_descriptor_dim = int(
             config.get('attribute_descriptor_dim', 16)
@@ -522,7 +525,7 @@ class AnomalyGFMModel(nn.Module):
         temporal_projected = self.temporal_projection(temporal_representations)
         spatial_projected = self.spatial_projection(spatial_representations)
         
-        if seq_len >= 2:
+        if seq_len >= 2 and self.use_residual_fusion:
             residual_changes = self.residual_module(
                 temporal_projected[:, 1:], temporal_projected[:, :-1],
                 spatial_projected[:, 1:], spatial_projected[:, :-1]
