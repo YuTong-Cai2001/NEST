@@ -121,7 +121,9 @@ foreach ($seed in $seedValues) {
             "--model_path", $checkpoint,
             "--start_year", "$StartYear",
             "--end_year", "$EndYear",
-            "--seed", "$seed"
+            "--seed", "$seed",
+            "--adaptation_mode", "score_fusion",
+            "--results_csv", "results/few_shot_runs.csv"
         )
     }
 }

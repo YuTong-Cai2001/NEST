@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .idea/
+.codex_spreadsheet/
 
 cache/
 processed_data/
@@ -12,4 +13,5 @@ data/
 results/zero_shot_runs.csv
 results/few_shot_runs.csv
 results/*_summary.csv
+results/*.inspect.ndjson
 figures/generated/

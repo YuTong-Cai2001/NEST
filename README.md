@@ -11,7 +11,7 @@ SPAD is a framework for zero-shot and few-shot anomalous-node detection in dynam
 ## Key Features
 
 - **Zero-Shot Anomaly Detection**: Can detect anomaly nodes in dynamic graphs without any labeled samples from the target domain
-- **Few-Shot Fine-tuning**: Supports rapid adaptation to target domains through sparse annotations
+- **Parameter-Efficient Few-Shot Adaptation**: Freezes the transferable SPAD backbone and updates a 513-parameter residual prototype adapter from sparse target annotations
 - **Temporal Modeling**: Explicitly captures temporal dependencies and structural evolution patterns
 - **Dual-Alignment Mechanism**: Combines self-evolution inconsistency modeling with population-level alignment
 - **Directional Prototype-Transport Residual**: Scores nodes that fail to follow the label-free source-to-target normal-population shift
@@ -56,6 +56,13 @@ ProtoDGAD/
 ├── anomaly_gfm_complete_model.py    # SPAD temporal graph model
 ├── data_processor.py                # Data loading and preprocessing
 ├── few_shot_finetune.py            # Few-shot fine-tuning implementation
+├── few_shot_adapter.py             # Frozen-backbone residual prototype adapter
+├── run_few_shot_adapter_curve.ps1  # 5/10/20-shot, three-seed adapter launcher
+├── summarize_few_shot_adapter.py   # Adapter mean/std aggregation
+├── few_shot_curve.py               # Fixed-query nested-support shot curve
+├── run_few_shot_experiments.ps1    # Three-seed few-shot launcher
+├── run_few_shot_curve.ps1          # 5/10/20-shot three-seed launcher
+├── summarize_few_shot.py           # Paired mean/std aggregation
 ├── model_adapter.py                # Sparse graph model adapter
 ├── sparse_graph_utils.py           # Sparse graph processing utilities
 ├── train_anomaly_gfm.py            # Main training script (zero-shot)
@@ -120,18 +127,25 @@ python train_anomaly_gfm.py --mode dynamic --start_year 2018 --end_year 2022 --e
 - `--end_year`: Ending year for training data
 - `--epochs`: Number of training epochs
 
-### Few-Shot Fine-tuning
+### Few-Shot Adaptation
 
-Fine-tune the pre-trained model on target domain with sparse annotations:
+Run the paper-facing parameter-efficient target-domain adaptation from the
+three retained zero-shot checkpoints:
 
-```bash
-python few_shot_finetune.py --model_path outputs/spad_full_seed42/checkpoints/best_source_loss.pth --seed 42
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_few_shot_adapter_curve.ps1
 ```
 
 This script will:
 1. Load the pre-trained checkpoint from zero-shot training
-2. Build a support set with a small number of labeled nodes
-3. Fine-tune the model for rapid target domain adaptation
+2. Reserve a nested maximum support pool and run 5/10/20-shot settings for seeds 42/43/44
+3. Freeze the SPAD backbone and update only a 513-parameter residual adapter
+4. Select the update count by five-fold support-only cross-validation
+5. Evaluate on the fixed disjoint query set and write paired AUC/AP results
+
+The candidate update range is 1--250 epochs with patience 40; the selected
+epoch is the median of the five fold-specific best epochs. Query labels are
+used only for final evaluation and never for model or epoch selection.
 
 ## Key Components
 
