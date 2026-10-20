@@ -36,10 +36,10 @@ from train_anomaly_gfm import (
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_OUT = ROOT / "outputs/spad_reverse_transfer_20261020"
+DEFAULT_OUT = ROOT / "outputs/spad_reverse_transfer_20261020_full_observed"
 SEEDS = (42, 43, 44)
 VARIANTS = ("full", "no_proto")
-SCHEMA = 1
+SCHEMA = 2
 
 
 def atomic_json(path, value):
@@ -70,10 +70,11 @@ def retained_windows(timestamps, width=7, maximum=20):
 
 
 def select_target_nodes(observed_edges, num_nodes, cap):
-    """Top endpoint degree, with deterministic original-ID tie breaking.
+    """All endpoints in the observed model-input windows, ordered by ID.
 
     The signature deliberately has no labels or class-count arguments.
     Both unknown/background and binary-labeled nodes can be selected.
+    A positive cap is a safety check, never a reason to discard neighbors.
     """
     edges = np.asarray(observed_edges, dtype=np.int64)
     if edges.ndim != 2 or edges.shape[1] != 2:
@@ -81,9 +82,9 @@ def select_target_nodes(observed_edges, num_nodes, cap):
     if not len(edges) or edges.min() < 0 or edges.max() >= num_nodes:
         raise ValueError("Missing edges or out-of-range node identifiers")
     degree = np.bincount(edges.reshape(-1), minlength=num_nodes)
-    candidates = np.flatnonzero(degree)
-    order = np.lexsort((candidates, -degree[candidates]))
-    selected = np.sort(candidates[order[:min(cap, len(order))]])
+    selected = np.flatnonzero(degree)
+    if cap > 0 and len(selected) > cap:
+        raise ValueError("Observed population exceeds safety cap; do not truncate neighborhoods")
     if not len(selected):
         raise ValueError("Empty target population")
     return selected, degree
@@ -127,8 +128,8 @@ def plan(cap):
         "source_years": [2018, 2019, 2020, 2021, 2022],
         "source_labels": "2022 binary labels only; -1 background is masked",
         "source_population": "all nodes in the five-year edge-endpoint union",
-        "target_population": "top endpoint degree over the 20 observed retained windows; no label input",
-        "target_node_cap": cap, "target_degree_ties": "ascending original node ID",
+        "target_population": "all edge endpoints in the final five retained windows; no label input or node subsampling",
+        "target_node_cap": cap, "target_node_order": "ascending original node ID",
         "target_window_width": 7, "target_max_retained_windows": 20,
         "target_window_sampling": "nonempty windows[::floor(W/20)][:20] when W>20",
         "model_input": "last five retained windows; descriptors computed before truncation",
@@ -189,13 +190,15 @@ def prepare(out, cap):
     if len(edges) != len(timestamps):
         raise ValueError("Timestamp and edge counts differ")
     origin, bins, window_ids = retained_windows(timestamps)
-    observed = np.isin(bins, window_ids)
+    observed = np.isin(bins, window_ids[-5:])
     selected, degree = select_target_nodes(edges[observed], raw["num_nodes"], cap)
     mapping = np.full(raw["num_nodes"], -1, dtype=np.int64)
     mapping[selected] = np.arange(len(selected), dtype=np.int64)
     target_graphs, edge_counts = [], []
     for window in window_ids:
         g, n = normalize_target_graph(edges[bins == window], mapping, len(selected))
+        if window in window_ids[-5:]:
+            assert n == np.count_nonzero(bins == window), "Lost a model-input edge"
         target_graphs.append(g)
         edge_counts.append(n)
     target_raw = np.asarray(raw["node_features"][selected], dtype=np.float32)
@@ -443,7 +446,8 @@ def evaluate_one(data, out, trained):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUT)
-    parser.add_argument("--target-nodes", type=int, default=100000)
+    parser.add_argument("--target-nodes", type=int, default=0,
+                        help="Optional safety cap; 0 keeps the full observed node universe")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()

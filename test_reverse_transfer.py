@@ -20,10 +20,12 @@ from evaluate_reference_scoring import score_metrics
 class ReverseTransferTests(unittest.TestCase):
     def test_label_blind_deterministic_selection(self):
         edges = np.array([[0, 1], [0, 2], [1, 2], [3, 4]])
-        selected, degree = select_target_nodes(edges, 7, 2)
-        np.testing.assert_array_equal(selected, [0, 1])
+        selected, degree = select_target_nodes(edges, 7, 0)
+        np.testing.assert_array_equal(selected, [0, 1, 2, 3, 4])
         np.testing.assert_array_equal(degree, [2, 2, 2, 1, 1, 0, 0])
-        np.testing.assert_array_equal(select_target_nodes(edges[::-1], 7, 2)[0], selected)
+        np.testing.assert_array_equal(select_target_nodes(edges[::-1], 7, 0)[0], selected)
+        with self.assertRaises(ValueError):
+            select_target_nodes(edges, 7, 2)
 
     def test_window_sampling_matches_original(self):
         timestamps = np.arange(117) * 7 + 1
