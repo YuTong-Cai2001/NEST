@@ -38,7 +38,7 @@ from train_anomaly_gfm import (
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_OUT = ROOT / "outputs/spad_dgraphfin_to_elliptic_actors_20261020"
+DEFAULT_OUT = ROOT / "outputs/spad_dgraphfin_to_elliptic_actors_20261020_main"
 PROVENANCE = ROOT.parent / "outputs/spad_final_ablation_20261007/component_results.json"
 SEEDS = (42, 43, 44)
 STEPS = (45, 46, 47, 48, 49)
@@ -126,7 +126,8 @@ def map_target_labels(classes, ids, latest_presence):
     if official.isna().any() or not official.isin((1, 2, 3)).all():
         raise ValueError("Unexpected/missing official wallet class")
     labels = official.map({1: 1, 2: 0, 3: -1}).to_numpy(dtype=np.int64)
-    active = np.isin(ids, np.asarray(latest_presence))
+    # Hash-index membership avoids NumPy's quadratic object-string fallback.
+    active = pd.Index(ids).isin(latest_presence)
     mask = active & np.isin(labels, (0, 1))
     return labels, mask, active
 
@@ -184,7 +185,7 @@ def prepare(out):
         graph, count = normalize_target_graph(edges, mapping, len(ids))
         assert count == len(current), "Truncated target neighborhoods"
         target_graphs.append(graph)
-        masks.append(np.isin(ids, presence.loc[presence["time"] == step, "address"]))
+        masks.append(index.isin(presence.loc[presence["time"] == step, "address"]))
         graph_stats.append({"time_step": step, "raw_pair_occurrences": count,
                             "raw_self_pair_occurrences": int((edges[:, 0] == edges[:, 1]).sum()),
                             "normalized_csr_nnz_including_diagonal": int(graph.nnz),
