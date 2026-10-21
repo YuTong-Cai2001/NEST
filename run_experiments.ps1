@@ -1,12 +1,12 @@
 param(
     [string]$PythonExecutable = "",
-    [string]$Seeds = "42",
+    [string]$Seeds = "42,43,44",
     [int]$Epochs = 50,
     [int]$StartYear = 2018,
     [int]$EndYear = 2022,
-    [string]$RunPrefix = "spad_dipt",
-    [string]$Variants = "full,svd_alignment,no_descriptors,no_residual,no_self,no_proto,dual",
-    [string]$ResultsCsv = "results/zero_shot_runs.csv",
+    [string]$RunPrefix = "nest_paper",
+    [string]$Variants = "full",
+    [string]$ResultsCsv = "results/reproduced/zero_shot_runs.csv",
     [switch]$SkipFewShot,
     [switch]$DryRun
 )
@@ -117,15 +117,25 @@ foreach ($seed in $seedValues) {
     if ((-not $SkipFewShot) -and ($variantValues -contains "full")) {
         $checkpoint = "outputs/$($RunPrefix)_full_seed$seed/checkpoints/best_source_loss.pth"
         Invoke-CheckedPython -Arguments @(
-            "few_shot_finetune.py",
+            "few_shot_curve.py",
             "--model_path", $checkpoint,
+            "--shots", "5,10,20",
+            "--normal_multiplier", "5",
+            "--max_support_abnormal", "20",
+            "--max_support_normal", "100",
+            "--min_adaptation_abnormal", "10",
             "--start_year", "$StartYear",
             "--end_year", "$EndYear",
             "--seed", "$seed",
-            "--adaptation_mode", "score_fusion",
-            "--results_csv", "results/few_shot_runs.csv"
+            "--results_csv", "results/reproduced/few_shot_curve_runs.csv"
         )
     }
 }
 
-Invoke-CheckedPython -Arguments @("plot_results.py")
+if ((-not $SkipFewShot) -and ($variantValues -contains "full")) {
+    Invoke-CheckedPython -Arguments @(
+        "summarize_few_shot_curve.py",
+        "--input", "results/reproduced/few_shot_curve_runs.csv",
+        "--output", "results/reproduced/few_shot_curve_mean_std.csv"
+    )
+}

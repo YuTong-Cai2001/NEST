@@ -1,6 +1,4 @@
 ﻿run_name,stage,method_version,prototype_mode,seed,start_year,end_year,lambda_self,lambda_proto,lambda_reg,auc,ap,evaluation_protocol,checkpoint
-spad_full_seed42,zero_shot,,single,42,2018,2022,0.5,0.3,0.1,0.6091068596850872,0.033478224269539496,,D:\第二篇\TAI_LaTex_Template\ProtoDGAD\outputs\spad_full_seed42\checkpoints\best_source_loss.pth
-spad_di2_full_seed42,zero_shot,di2,single,42,2018,2022,0.5,0.3,0.1,0.6448668818890226,0.04800471911195277,,D:\第二篇\TAI_LaTex_Template\ProtoDGAD\outputs\spad_di2_full_seed42\checkpoints\best_source_loss.pth
 spad_dipt_full_seed42,zero_shot,dipt,single,42,2018,2022,0.5,0.3,0,0.7881910122754652,0.10848034957619382,labeled_target_nodes_only,D:\第二篇\TAI_LaTex_Template\ProtoDGAD\outputs\spad_ablation_no_reg_seed42\checkpoints\best_source_loss.pth
 spad_dipt_full_seed43,zero_shot,dipt,single,43,2018,2022,0.5,0.3,0,0.7663668810774751,0.08721048686520577,labeled_target_nodes_only,D:\第二篇\TAI_LaTex_Template\ProtoDGAD\outputs\spad_ablation_no_reg_seed43\checkpoints\best_source_loss.pth
 spad_dipt_full_seed44,zero_shot,dipt,single,44,2018,2022,0.5,0.3,0,0.7567208293364626,0.08208605995506783,labeled_target_nodes_only,D:\第二篇\TAI_LaTex_Template\ProtoDGAD\outputs\spad_ablation_no_reg_seed44\checkpoints\best_source_loss.pth

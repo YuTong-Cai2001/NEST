@@ -10,8 +10,12 @@ outputs/
 checkpoints/
 data/
 
-results/zero_shot_runs.csv
+results/reproduced/
 results/few_shot_runs.csv
 results/*_summary.csv
 results/*.inspect.ndjson
 figures/generated/
+*.pth
+*.pkl
+*.npz
+*.xlsx

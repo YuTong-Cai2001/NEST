@@ -8,9 +8,9 @@ param(
     [int]$MinAdaptationAbnormal = 10,
     [int]$StartYear = 2018,
     [int]$EndYear = 2022,
-    [string]$CheckpointPrefix = "spad_ablation_no_reg_seed",
-    [string]$ResultsCsv = "results/few_shot_curve_runs.csv",
-    [string]$SummaryCsv = "results/few_shot_curve_mean_std.csv",
+    [string]$CheckpointPrefix = "nest_paper_full_seed",
+    [string]$ResultsCsv = "results/reproduced/few_shot_curve_runs.csv",
+    [string]$SummaryCsv = "results/reproduced/few_shot_curve_mean_std.csv",
     [switch]$DryRun
 )
 
