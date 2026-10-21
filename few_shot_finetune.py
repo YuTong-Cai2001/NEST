@@ -9,8 +9,14 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
 import argparse
+import csv
+import hashlib
+import random
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
@@ -22,10 +28,44 @@ from sparse_graph_utils import SparseGraphProcessor
 import scipy.sparse as sp
 
 
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def upsert_csv_row(path: str, row: Dict, key_fields=('run_name', 'stage', 'seed')):
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_rows = []
+    if output_path.exists():
+        with output_path.open('r', newline='', encoding='utf-8-sig') as handle:
+            existing_rows = list(csv.DictReader(handle))
+    existing_rows = [
+        old for old in existing_rows
+        if not all(str(old.get(key, '')) == str(row.get(key, '')) for key in key_fields)
+    ]
+    fieldnames = list(row.keys())
+    for old in existing_rows:
+        for field in old:
+            if field not in fieldnames:
+                fieldnames.append(field)
+    with output_path.open('w', newline='', encoding='utf-8-sig') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(existing_rows + [row])
+
+
 class FewShotSupportSet:
     """Few-shot Support Set Builder"""
     
-    def __init__(self, num_abnormal: int = 10, num_normal: int = 50):
+    def __init__(
+        self, num_abnormal: int = 10, num_normal: int = 50, seed: int = 42,
+    ):
         """
         Args:
             num_abnormal: Number of abnormal nodes
@@ -33,6 +73,7 @@ class FewShotSupportSet:
         """
         self.num_abnormal = num_abnormal
         self.num_normal = num_normal
+        self.seed = int(seed)
     
     def build_support_set(self, temporal_data: Dict, labels: np.ndarray, 
                           last_time_idx: int = -1) -> Tuple[np.ndarray, str]:
@@ -65,27 +106,29 @@ class FewShotSupportSet:
         num_normal_available = len(normal_nodes)
         
         
+        rng = np.random.default_rng(self.seed)
         if num_anomaly_available >= self.num_abnormal:
-            np.random.shuffle(abnormal_nodes)
-            np.random.shuffle(normal_nodes)
+            rng.shuffle(abnormal_nodes)
+            rng.shuffle(normal_nodes)
             support_abnormal = abnormal_nodes[:self.num_abnormal]
             support_normal = normal_nodes[:min(self.num_normal, num_normal_available)]
             support_node_ids = np.concatenate([support_abnormal, support_normal])
             strategy = "mixed"
         elif num_anomaly_available >= 5:
-            np.random.shuffle(normal_nodes)
+            rng.shuffle(normal_nodes)
             support_abnormal = abnormal_nodes  
             support_normal = normal_nodes[:self.num_normal]
             support_node_ids = np.concatenate([support_abnormal, support_normal])
             strategy = "mixed_all_abnormal"
         else:
-            np.random.shuffle(normal_nodes)
+            rng.shuffle(normal_nodes)
             support_node_ids = normal_nodes[:self.num_normal]
             strategy = "normal_only"
         
         print(f"    Support set built:")
-        print(f"      - Abnormal nodes: {len(support_node_ids[support_node_ids < len(labels)]) if strategy != 'normal_only' else 0}")
-        print(f"      - Normal nodes: {len(support_node_ids) - (len(support_node_ids[support_node_ids < len(labels)]) if strategy != 'normal_only' else 0)}")
+        support_labels = labels[support_node_ids]
+        print(f"      - Abnormal nodes: {int((support_labels == 1).sum())}")
+        print(f"      - Normal nodes: {int((support_labels == 0).sum())}")
         print(f"      - Total support set size: {len(support_node_ids)} nodes")
         
         return support_node_ids, strategy
@@ -186,9 +229,12 @@ class FewShotFinetuner:
         """
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.seed = int(config.get('seed', 42))
+        set_global_seed(self.seed)
         
-        self.model_path = config.get('model_path', 
-            'zero_shot/checkpoints/turning_point_epoch_16_batch_0_consistency_0.305305.pth')
+        self.model_path = config.get('model_path')
+        if not self.model_path:
+            raise ValueError('model_path is required')
         
         # Fine-tuning parameters
         self.num_abnormal = config.get('num_abnormal', 10)
@@ -196,6 +242,12 @@ class FewShotFinetuner:
         self.learning_rate = config.get('learning_rate', 1e-4)
         self.num_epochs = config.get('num_epochs', 20)
         self.batch_size = config.get('batch_size', 32)
+        self.lambda_fs = float(config.get('lambda_fs', 0.5))
+        self.max_neighbors_per_node = int(config.get('max_neighbors_per_node', 100))
+        self.adaptation_mode = config.get('adaptation_mode', 'score_fusion')
+        self.cv_folds = int(config.get('cv_folds', 5))
+        self.min_cv_gain = float(config.get('min_cv_gain', 0.05))
+        self.results_csv = config.get('results_csv', 'results/few_shot_runs.csv')
         
         # Data paths
         self.figraph_path = config.get('figraph_path', 'data/FiGraph-main/data/')
@@ -207,28 +259,35 @@ class FewShotFinetuner:
     
     def load_pretrained_model(self) -> AnomalyGFMModel:
         """Load pre-trained model"""
-        
-        model_config = create_model_config(
-            feature_dim=17,  # FiGraph feature dimension
-            sequence_length=5  # 5 time windows
-        )
-        
-        # Create model
-        model = AnomalyGFMModel(model_config)
-        
-        # Load weights
         checkpoint = torch.load(self.model_path, map_location=self.device)
-        
-        # Handle different checkpoint formats
-        if isinstance(checkpoint, dict):
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            elif 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'], strict=False)
-            else:
-                model.load_state_dict(checkpoint, strict=False)
-        else:
-            model.load_state_dict(checkpoint, strict=False)
+
+        model_config = checkpoint.get('resolved_model_config')
+        if model_config is None:
+            raise ValueError(
+                'Checkpoint does not contain resolved_model_config. '
+                'Please use a checkpoint produced by the repaired zero-shot script.'
+            )
+        model = AnomalyGFMModel(model_config)
+
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        # Zero-shot checkpoints wrap the model in SparseGraphModelAdapter.
+        if any(key.startswith('base_model.') for key in state_dict):
+            state_dict = {
+                key[len('base_model.'):]: value
+                for key, value in state_dict.items()
+                if key.startswith('base_model.')
+            }
+
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        loaded_keys = len(model.state_dict()) - len(incompatible.missing_keys)
+        load_ratio = loaded_keys / max(len(model.state_dict()), 1)
+        if load_ratio < 0.8:
+            raise RuntimeError(
+                f'Only {load_ratio:.1%} of model tensors were restored; '
+                f'missing={incompatible.missing_keys[:10]}'
+            )
+        self.checkpoint = checkpoint
+        self.model_config = model_config
         
         model = model.to(self.device)
         model.eval()  # Set to evaluation mode initially
@@ -262,7 +321,13 @@ class FewShotFinetuner:
         
 
         model.normal_prototype.requires_grad = True
-        model.abnormal_prototype.requires_grad = False
+        model.score_scale_raw.requires_grad = True
+        model.score_threshold.requires_grad = True
+        model.prototype_score_weight_raw.requires_grad = True
+        model.temporal_score_weight_raw.requires_grad = True
+        model.temporal_score_threshold.requires_grad = True
+        if model.abnormal_prototype is not None:
+            model.abnormal_prototype.requires_grad = False
         print(f"    Unfreeze normal prototype parameters (single-prototype fine-tuning)")
         
         # Count trainable parameters
@@ -271,6 +336,336 @@ class FewShotFinetuner:
         print(f"\n    Parameter statistics:")
         print(f"      - Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
         print(f"      - Frozen parameters: {total_params - trainable_params:,} ({(total_params-trainable_params)/total_params*100:.2f}%)")
+
+    @staticmethod
+    def _latest_snapshot_local_score(
+        fused_sequence: torch.Tensor, edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """Incident-neighbour cosine distance on the final snapshot."""
+        node_state = F.normalize(fused_sequence[:, -1], p=2, dim=-1)
+        batch_size, num_nodes, _ = node_state.shape
+        scores = node_state.new_zeros(batch_size, num_nodes)
+        if edge_index.numel() == 0:
+            return scores
+        source, target = edge_index[0], edge_index[1]
+        valid = (
+            (source >= 0) & (source < num_nodes)
+            & (target >= 0) & (target < num_nodes)
+        )
+        source, target = source[valid], target[valid]
+        for batch_idx in range(batch_size):
+            state = node_state[batch_idx]
+            neighbour_sum = torch.zeros_like(state)
+            degree = state.new_zeros(num_nodes)
+            neighbour_sum.index_add_(0, target, state[source])
+            neighbour_sum.index_add_(0, source, state[target])
+            ones = torch.ones_like(source, dtype=state.dtype)
+            degree.index_add_(0, target, ones)
+            degree.index_add_(0, source, ones)
+            observed = degree > 0
+            neighbour_mean = neighbour_sum / degree.clamp_min(1).unsqueeze(-1)
+            local_distance = 1 - F.cosine_similarity(
+                state, neighbour_mean, dim=-1
+            )
+            scores[batch_idx, observed] = local_distance[observed]
+        return scores
+
+    def _full_graph_forward(
+        self, model: AnomalyGFMModel, test_data: Dict,
+    ) -> Dict[str, torch.Tensor]:
+        """Run one deterministic full-target-graph forward pass."""
+        model.eval()
+        sequence_length = min(
+            self.model_config['sequence_length'],
+            len(test_data['temporal_sequences'][0]),
+        )
+        features = test_data['temporal_sequences'][0][-sequence_length:]
+        adjacencies = test_data['temporal_adjacencies'][0][-sequence_length:]
+        temporal_tensor = torch.as_tensor(
+            np.stack(features), dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        adjacency_info = []
+        for adjacency in adjacencies:
+            edge_index, edge_attr = self.sparse_processor.sparse_to_pyg_format(
+                adjacency
+            )
+            adjacency_info.append({
+                'edge_index': edge_index.to(self.device),
+                'edge_attr': (
+                    edge_attr.to(self.device) if edge_attr is not None else None
+                ),
+                'num_nodes': temporal_tensor.shape[2],
+            })
+        with torch.no_grad():
+            output = model(
+                temporal_tensor, adjacency_info, temporal_tensor[:, -1]
+            )
+            output['latest_snapshot_local'] = self._latest_snapshot_local_score(
+                output['fused_sequence'], adjacency_info[-1]['edge_index']
+            )
+        return output
+
+    @staticmethod
+    def _percentile_rank(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        values = np.nan_to_num(values, nan=0.0, posinf=1e6, neginf=-1e6)
+        order = np.argsort(values, kind='stable')
+        ranks = np.empty(values.shape[0], dtype=np.float64)
+        ranks[order] = np.arange(values.shape[0], dtype=np.float64)
+        return ranks / max(values.shape[0] - 1, 1)
+
+    def extract_score_features(
+        self, model: AnomalyGFMModel, test_data: Dict,
+    ) -> Tuple[np.ndarray, List[str], Dict[str, np.ndarray]]:
+        """Extract frozen SPAD scores and representations for adaptation."""
+        output = self._full_graph_forward(model, test_data)
+        feature_tensors = [
+            ('recency_dynamic_local', output['recency_neighbor_inconsistency']),
+            ('uniform_dynamic_local', output['dynamic_neighbor_inconsistency']),
+            ('latest_snapshot_local', output['latest_snapshot_local']),
+            ('prototype_transport_residual', output['prototype_transport_residual']),
+            ('transported_prototype_distance', output['anomaly_distances']),
+        ]
+        names = [name for name, _ in feature_tensors]
+        columns = []
+        for _, tensor in feature_tensors:
+            values = tensor.detach().cpu().numpy().reshape(-1)
+            columns.append(self._percentile_rank(values))
+        features = np.column_stack(columns)
+        if not np.isfinite(features).all():
+            raise RuntimeError('Non-finite score features after percentile ranking')
+        representations = {
+            'mean_fused': output['fused_representations'][0]
+                .detach().cpu().numpy(),
+            'latest_fused': output['fused_sequence'][0, -1]
+                .detach().cpu().numpy(),
+            'temporal_change': (
+                output['fused_sequence'][0, -1]
+                - output['fused_sequence'][0, 0]
+            ).detach().cpu().numpy(),
+        }
+        return features, names, representations
+
+    def _prototype_rank(
+        self, representations: np.ndarray, labels: np.ndarray,
+        train_indices: np.ndarray,
+    ) -> np.ndarray:
+        """Rank nodes by their cosine margin to target support prototypes."""
+        vectors = np.asarray(representations, dtype=np.float64)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        vectors = vectors / np.clip(norms, 1e-12, None)
+        train_labels = np.asarray(labels)[train_indices].astype(int)
+        positive = vectors[train_indices][train_labels == 1]
+        negative = vectors[train_indices][train_labels == 0]
+        positive_prototype = positive.mean(axis=0)
+        negative_prototype = negative.mean(axis=0)
+        positive_prototype /= max(np.linalg.norm(positive_prototype), 1e-12)
+        negative_prototype /= max(np.linalg.norm(negative_prototype), 1e-12)
+        margin = (
+            vectors @ positive_prototype - vectors @ negative_prototype
+        )
+        return self._percentile_rank(margin)
+
+    @staticmethod
+    def _ranking_metric(labels: np.ndarray, scores: np.ndarray) -> float:
+        return 0.5 * (
+            roc_auc_score(labels, scores)
+            + average_precision_score(labels, scores)
+        )
+
+    def fit_score_fusion(
+        self, features: np.ndarray, feature_names: List[str],
+        representations: Dict[str, np.ndarray], labels: np.ndarray,
+        support_node_ids: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict]:
+        """Fit a conservative support-only few-shot score readout.
+
+        The zero-shot ranking remains an explicit anchor.  Target labels may
+        only add a small correction, selected by stratified support-set CV.
+        This prevents ten positive examples from replacing a strong global
+        ranking with an unstable target-only classifier.
+        """
+        support_labels = np.asarray(labels)[support_node_ids].astype(int)
+        support_features = features[support_node_ids]
+        class_counts = np.bincount(support_labels, minlength=2)
+        folds = min(self.cv_folds, int(class_counts.min()))
+        if folds < 2:
+            raise ValueError('At least two support examples per class are required')
+
+        feature_sets = {
+            'local_temporal': [0, 1, 2],
+            'local_plus_transport': [0, 1, 2, 3],
+            'all_scores': list(range(features.shape[1])),
+        }
+        c_values = (0.05, 0.2, 1.0, 5.0)
+        alpha_values = (0.05, 0.10, 0.20, 0.35)
+        splitter = StratifiedKFold(
+            n_splits=folds, shuffle=True, random_state=self.seed
+        )
+
+        base_fold_scores = []
+        for _, val_idx in splitter.split(support_features, support_labels):
+            base_fold_scores.append(self._ranking_metric(
+                support_labels[val_idx], support_features[val_idx, 0]
+            ))
+        base_cv = float(np.mean(base_fold_scores))
+        best = {
+            'name': 'zero_shot_recency',
+            'indices': [0],
+            'representation': None,
+            'C': None,
+            'alpha': 0.0,
+            'cv_metric': base_cv,
+        }
+
+        for set_name, indices in feature_sets.items():
+            for c_value in c_values:
+                for alpha in alpha_values:
+                    fold_scores = []
+                    for train_idx, val_idx in splitter.split(
+                        support_features, support_labels
+                    ):
+                        classifier = LogisticRegression(
+                            C=c_value,
+                            class_weight='balanced',
+                            solver='liblinear',
+                            max_iter=2000,
+                            random_state=self.seed,
+                        )
+                        classifier.fit(
+                            support_features[train_idx][:, indices],
+                            support_labels[train_idx],
+                        )
+                        calibrated = classifier.predict_proba(
+                            support_features[val_idx][:, indices]
+                        )[:, 1]
+                        blended = (
+                            (1 - alpha) * support_features[val_idx, 0]
+                            + alpha * calibrated
+                        )
+                        fold_scores.append(self._ranking_metric(
+                            support_labels[val_idx], blended
+                        ))
+                    cv_metric = float(np.mean(fold_scores))
+                    if cv_metric > best['cv_metric'] + 1e-12:
+                        best = {
+                            'name': set_name,
+                            'indices': indices,
+                            'representation': None,
+                            'C': c_value,
+                            'alpha': alpha,
+                            'cv_metric': cv_metric,
+                        }
+
+        # A target-domain positive/negative prototype margin is the natural
+        # few-shot extension of SPAD's source normal prototype.  Prototypes are
+        # rebuilt inside every fold, so validation labels never enter fitting.
+        for representation_name, representation in representations.items():
+            for alpha in alpha_values:
+                fold_scores = []
+                for train_idx, val_idx in splitter.split(
+                    support_features, support_labels
+                ):
+                    train_node_ids = support_node_ids[train_idx]
+                    prototype_score = self._prototype_rank(
+                        representation, labels, train_node_ids
+                    )
+                    blended = (
+                        (1 - alpha) * support_features[val_idx, 0]
+                        + alpha * prototype_score[support_node_ids[val_idx]]
+                    )
+                    fold_scores.append(self._ranking_metric(
+                        support_labels[val_idx], blended
+                    ))
+                cv_metric = float(np.mean(fold_scores))
+                if cv_metric > best['cv_metric'] + 1e-12:
+                    best = {
+                        'name': 'support_prototype',
+                        'indices': [0],
+                        'representation': representation_name,
+                        'C': None,
+                        'alpha': alpha,
+                        'cv_metric': cv_metric,
+                    }
+
+        if best['cv_metric'] < base_cv + self.min_cv_gain:
+            best = {
+                'name': 'zero_shot_recency', 'indices': [0], 'C': None,
+                'representation': None, 'alpha': 0.0,
+                'cv_metric': base_cv,
+            }
+
+        if best['name'] == 'zero_shot_recency':
+            final_scores = features[:, 0].copy()
+            best.update({
+                'coef': [1.0], 'intercept': 0.0,
+                'selected_features': [feature_names[0]],
+            })
+        elif best['name'] == 'support_prototype':
+            prototype_score = self._prototype_rank(
+                representations[best['representation']], labels,
+                support_node_ids,
+            )
+            final_scores = (
+                (1 - best['alpha']) * features[:, 0]
+                + best['alpha'] * prototype_score
+            )
+            best.update({
+                'coef': [], 'intercept': 0.0,
+                'selected_features': [
+                    feature_names[0],
+                    f"support_{best['representation']}_prototype_margin",
+                ],
+            })
+        else:
+            classifier = LogisticRegression(
+                C=best['C'],
+                class_weight='balanced',
+                solver='liblinear',
+                max_iter=2000,
+                random_state=self.seed,
+            )
+            classifier.fit(
+                support_features[:, best['indices']], support_labels
+            )
+            calibrated = classifier.predict_proba(
+                features[:, best['indices']]
+            )[:, 1]
+            final_scores = (
+                (1 - best['alpha']) * features[:, 0]
+                + best['alpha'] * calibrated
+            )
+            best.update({
+                'coef': classifier.coef_[0].tolist(),
+                'intercept': float(classifier.intercept_[0]),
+                'selected_features': [
+                    feature_names[index] for index in best['indices']
+                ],
+            })
+        best['base_cv_metric'] = base_cv
+        best['cv_gain'] = best['cv_metric'] - base_cv
+        return final_scores, best
+
+    def evaluate_score_array(
+        self, scores: np.ndarray, labels: np.ndarray,
+        support_node_ids: np.ndarray, evaluation_name: str,
+    ) -> Dict:
+        valid_mask = np.isin(labels, [0, 1])
+        valid_mask[np.asarray(support_node_ids, dtype=np.int64)] = False
+        query_labels = np.asarray(labels)[valid_mask].astype(int)
+        query_scores = np.asarray(scores)[valid_mask]
+        if np.unique(query_labels).size != 2:
+            raise ValueError('Query set does not contain both valid classes')
+        eval_results = AnomalyGFMDataProcessor.evaluate_ranking_performance(
+            query_labels, query_scores, evaluation_name
+        )
+        return {
+            'auc': eval_results['roc_auc'],
+            'ap': eval_results['average_precision'],
+            'scores': query_scores,
+            'labels': query_labels,
+            'eval_results': eval_results,
+        }
     
     def load_test_data(self) -> Tuple[Dict, np.ndarray]:
         """Load test data (FiGraph 2018-2022)"""
@@ -278,11 +673,15 @@ class FewShotFinetuner:
 
         data_config = {
             'temporal_window': 7,
-            'target_dim': 17,
-            'use_svd': True,
+            'target_dim': self.model_config['feature_dim'],
+            'use_svd': False,
+            'alignment_mode': self.checkpoint.get('config', {}).get(
+                'alignment_mode', 'invariant'
+            ),
             'figraph_path': self.figraph_path,
             'cache_dir': 'cache/',
-            'enable_cache': True
+            'enable_cache': True,
+            'seed': self.seed,
         }
         
         processor = AnomalyGFMDataProcessor(data_config)
@@ -291,6 +690,31 @@ class FewShotFinetuner:
         figraph_temporal = processor.load_figraph_temporal_sequence(
             start_year=self.start_year,
             end_year=self.end_year
+        )
+
+        aligner_path = self.checkpoint.get('feature_aligner_path')
+        if not aligner_path or not os.path.exists(aligner_path):
+            candidate = Path(self.model_path).resolve().parents[1] / 'feature_aligner.pkl'
+            aligner_path = str(candidate)
+        if not os.path.exists(aligner_path):
+            raise FileNotFoundError(
+                f'Feature aligner not found: {aligner_path}. '
+                'Run zero-shot training before few-shot fine-tuning.'
+            )
+        processor.load_feature_aligner(aligner_path)
+        for batch_idx, sequence in enumerate(figraph_temporal['temporal_sequences']):
+            for time_idx, features in enumerate(sequence):
+                figraph_temporal['temporal_sequences'][batch_idx][time_idx] = (
+                    processor.transform_target_features(features)
+                )
+            figraph_temporal['temporal_sequences'][batch_idx] = (
+                processor.append_structural_temporal_features(
+                    figraph_temporal['temporal_sequences'][batch_idx],
+                    figraph_temporal['temporal_adjacencies'][batch_idx],
+                )
+            )
+        figraph_temporal['feature_dim'] = (
+            figraph_temporal['temporal_sequences'][0][0].shape[1]
         )
         
         if figraph_temporal.get('temporal_labels'):
@@ -308,8 +732,8 @@ class FewShotFinetuner:
         
         return figraph_temporal, labels
     
-    def finetune(self, model: AnomalyGFMModel, train_loader: DataLoader):
-        """Fine-tuning training"""
+    def _legacy_finetune_unused(self, model: AnomalyGFMModel, train_loader: DataLoader):
+        """Deprecated node-wise implementation retained only for old checkpoints."""
         print(f"\n Starting fine-tuning training...")
         
         # Set model to training mode
@@ -414,8 +838,154 @@ class FewShotFinetuner:
         
         print(f"    Fine-tuning training completed")
         return model
+
+    def _build_support_subgraph(
+        self, test_data: Dict, support_node_ids: np.ndarray
+    ) -> Tuple[np.ndarray, List[np.ndarray], List[sp.csr_matrix]]:
+        """Build one deterministic 1-hop subgraph around all support nodes."""
+        adj_last = test_data['temporal_adjacencies'][0][-1].tocsr()
+        selected = set(int(node_id) for node_id in support_node_ids)
+        rng = np.random.default_rng(self.seed)
+        for node_id in support_node_ids:
+            start, end = adj_last.indptr[node_id], adj_last.indptr[node_id + 1]
+            neighbors = adj_last.indices[start:end]
+            if len(neighbors) > self.max_neighbors_per_node:
+                neighbors = rng.choice(
+                    neighbors, self.max_neighbors_per_node, replace=False
+                )
+            selected.update(int(value) for value in neighbors)
+
+        subgraph_nodes = np.asarray(sorted(selected), dtype=np.int64)
+        temporal_features = [
+            features[subgraph_nodes]
+            for features in test_data['temporal_sequences'][0]
+        ]
+        temporal_adjacencies = [
+            adjacency[subgraph_nodes][:, subgraph_nodes].tocsr()
+            for adjacency in test_data['temporal_adjacencies'][0]
+        ]
+        return subgraph_nodes, temporal_features, temporal_adjacencies
+
+    def finetune_subgraph(
+        self, model: AnomalyGFMModel, test_data: Dict,
+        labels: np.ndarray, support_node_ids: np.ndarray,
+    ) -> AnomalyGFMModel:
+        """Fine-tune on a support-centered graph while preserving neighborhoods."""
+        model.train()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = optim.Adam(
+            trainable_params, lr=self.learning_rate, weight_decay=1e-5
+        )
+
+        nodes, feature_sequence, adjacency_sequence = self._build_support_subgraph(
+            test_data, support_node_ids
+        )
+        sequence_length = min(
+            self.model_config['sequence_length'], len(feature_sequence)
+        )
+        feature_sequence = feature_sequence[-sequence_length:]
+        adjacency_sequence = adjacency_sequence[-sequence_length:]
+        temporal_tensor = torch.as_tensor(
+            np.stack(feature_sequence), dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+
+        adjacency_info = []
+        for adjacency in adjacency_sequence:
+            edge_index, edge_attr = self.sparse_processor.sparse_to_pyg_format(adjacency)
+            adjacency_info.append({
+                'edge_index': edge_index.to(self.device),
+                'edge_attr': edge_attr.to(self.device) if edge_attr is not None else None,
+                'num_nodes': len(nodes),
+            })
+
+        local_index = {node_id: idx for idx, node_id in enumerate(nodes.tolist())}
+        support_positions = torch.as_tensor(
+            [local_index[int(node_id)] for node_id in support_node_ids],
+            dtype=torch.long,
+            device=self.device,
+        )
+        support_labels = torch.as_tensor(
+            labels[support_node_ids], dtype=torch.float32, device=self.device
+        )
+
+        for epoch in range(self.num_epochs):
+            optimizer.zero_grad()
+            output = model(
+                temporal_tensor, adjacency_info, temporal_tensor[:, -1]
+            )
+            logits = output['anomaly_logits'][0, support_positions]
+            detection_loss = F.binary_cross_entropy_with_logits(
+                logits, support_labels
+            )
+            similarities = output['sim_to_normal'][0, support_positions]
+            normal_mask = support_labels == 0
+            prototype_loss = (
+                (1 - similarities[normal_mask]).mean()
+                if normal_mask.any() else logits.new_tensor(0.0)
+            )
+            total_loss = detection_loss + self.lambda_fs * prototype_loss
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+
+            if epoch == 0 or (epoch + 1) % 5 == 0 or epoch + 1 == self.num_epochs:
+                print(
+                    f"   Epoch {epoch + 1}/{self.num_epochs}: "
+                    f"total={total_loss.item():.6f}, "
+                    f"det={detection_loss.item():.6f}, "
+                    f"proto={prototype_loss.item():.6f}"
+                )
+        return model
+
+    def evaluate_full_graph(
+        self, model: AnomalyGFMModel, test_data: Dict,
+        labels: np.ndarray, support_node_ids: np.ndarray,
+        evaluation_name: str = 'Few-Shot-Finetuned-QuerySet',
+    ) -> Dict:
+        """Evaluate the query set in one structurally correct full-graph pass."""
+        model.eval()
+        sequence_length = min(
+            self.model_config['sequence_length'],
+            len(test_data['temporal_sequences'][0]),
+        )
+        features = test_data['temporal_sequences'][0][-sequence_length:]
+        adjacencies = test_data['temporal_adjacencies'][0][-sequence_length:]
+        temporal_tensor = torch.as_tensor(
+            np.stack(features), dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        adjacency_info = []
+        for adjacency in adjacencies:
+            edge_index, edge_attr = self.sparse_processor.sparse_to_pyg_format(adjacency)
+            adjacency_info.append({
+                'edge_index': edge_index.to(self.device),
+                'edge_attr': edge_attr.to(self.device) if edge_attr is not None else None,
+                'num_nodes': temporal_tensor.shape[2],
+            })
+
+        with torch.no_grad():
+            output = model(
+                temporal_tensor, adjacency_info, temporal_tensor[:, -1]
+            )
+            scores = output['anomaly_scores'][0].detach().cpu().numpy()
+
+        valid_mask = np.isin(labels, [0, 1])
+        valid_mask[np.asarray(support_node_ids, dtype=np.int64)] = False
+        query_labels = np.asarray(labels)[valid_mask]
+        query_scores = scores[valid_mask]
+        if len(np.unique(query_labels)) < 2:
+            raise ValueError('Query set does not contain both valid classes')
+        eval_results = AnomalyGFMDataProcessor.evaluate_ranking_performance(
+            query_labels, query_scores, evaluation_name
+        )
+        return {
+            'auc': eval_results['roc_auc'],
+            'ap': eval_results['average_precision'],
+            'scores': query_scores,
+            'labels': query_labels,
+            'eval_results': eval_results,
+        }
     
-    def evaluate(self, model: AnomalyGFMModel, test_data: Dict, labels: np.ndarray, 
+    def _legacy_evaluate_unused(self, model: AnomalyGFMModel, test_data: Dict, labels: np.ndarray,
                  support_node_ids: np.ndarray):
         """
         Evaluate model performance (query set)
@@ -533,114 +1103,159 @@ class FewShotFinetuner:
             }
     
     def run(self):
-        """Run complete fine-tuning workflow"""
+        """Run the selected few-shot adaptation workflow."""
         print("=" * 60)
-        print(" AnomalyGFM Few-Shot Fine-tuning")
+        print(" SPAD Few-Shot Adaptation")
         print("=" * 60)
         
         # Load pre-trained model
         model = self.load_pretrained_model()
         
-        # Set parameter freeze/unfreeze
-        self.freeze_and_unfreeze_parameters(model)
+        if self.adaptation_mode == 'network':
+            self.freeze_and_unfreeze_parameters(model)
+        elif self.adaptation_mode == 'score_fusion':
+            for parameter in model.parameters():
+                parameter.requires_grad = False
+            print("    Encoder and representation model frozen")
+        else:
+            raise ValueError(
+                f'Unknown adaptation_mode: {self.adaptation_mode}'
+            )
         
         # Load test data
         test_data, labels = self.load_test_data()
         
-        actual_feature_dim = test_data['feature_dim']
-        expected_feature_dim = 17  # Pre-trained model's expected dimension
-        
-        if actual_feature_dim != expected_feature_dim:
-            print(f"\n Feature dimension mismatch: actual={actual_feature_dim}, expected={expected_feature_dim}")
-            print(f"   Adding feature projection layer: {actual_feature_dim} -> {expected_feature_dim}")
-            
-            # Create feature projection layer (trainable)
-            feature_projection = nn.Linear(actual_feature_dim, expected_feature_dim).to(self.device)
-            # Use Xavier initialization
-            nn.init.xavier_uniform_(feature_projection.weight)
-            nn.init.zeros_(feature_projection.bias)
-            
-            # Add projection layer to model
-            model.feature_projection = feature_projection
-            model.actual_feature_dim = actual_feature_dim
-            model.expected_feature_dim = expected_feature_dim
-            model.use_feature_projection = True
-            
-            # Unfreeze projection layer parameters (allow fine-tuning)
-            for param in feature_projection.parameters():
-                param.requires_grad = True
-            
-            print(f"    Feature projection layer added and unfrozen")
-        else:
-            model.use_feature_projection = False
-            model.actual_feature_dim = actual_feature_dim
-            model.expected_feature_dim = expected_feature_dim
+        if test_data['feature_dim'] != self.model_config['feature_dim']:
+            raise ValueError(
+                f"Aligned feature dimension {test_data['feature_dim']} does not "
+                f"match checkpoint dimension {self.model_config['feature_dim']}"
+            )
         
         # Build support set
         support_set_builder = FewShotSupportSet(
             num_abnormal=self.num_abnormal,
-            num_normal=self.num_normal
+            num_normal=self.num_normal,
+            seed=self.seed,
         )
         support_node_ids, strategy = support_set_builder.build_support_set(
             test_data, labels, last_time_idx=-1
         )
-        
-        # Create dataset and data loader
-        dataset = FewShotDataset(
-            test_data, support_node_ids, labels, sequence_length=5
+
+        if self.adaptation_mode == 'score_fusion':
+            (
+                score_features, score_feature_names, score_representations,
+            ) = self.extract_score_features(model, test_data)
+            zero_shot_query_results = self.evaluate_score_array(
+                score_features[:, 0], labels, support_node_ids,
+                evaluation_name='Few-Shot-Pretrained-QuerySet',
+            )
+            adapted_scores, adaptation = self.fit_score_fusion(
+                score_features, score_feature_names, score_representations,
+                labels, support_node_ids,
+            )
+            results = self.evaluate_score_array(
+                adapted_scores, labels, support_node_ids,
+                evaluation_name='Few-Shot-ScoreFusion-QuerySet',
+            )
+            save_path = self.model_path.replace(
+                '.pth', '_fewshot_score_fusion.pth'
+            )
+            torch.save({
+                'support_node_ids': support_node_ids,
+                'strategy': strategy,
+                'adaptation_mode': self.adaptation_mode,
+                'adaptation': adaptation,
+                'score_feature_names': score_feature_names,
+                'zero_shot_query_results': zero_shot_query_results,
+                'results': results,
+            }, save_path)
+            print(
+                f"    Selected readout: {adaptation['name']} | "
+                f"features={adaptation['selected_features']} | "
+                f"C={adaptation['C']} | alpha={adaptation['alpha']} | "
+                f"support-CV gain={adaptation['cv_gain']:.6f}"
+            )
+        else:
+            zero_shot_query_results = self.evaluate_full_graph(
+                model, test_data, labels, support_node_ids,
+                evaluation_name='Few-Shot-Pretrained-QuerySet',
+            )
+            model = self.finetune_subgraph(
+                model, test_data, labels, support_node_ids
+            )
+            results = self.evaluate_full_graph(
+                model, test_data, labels, support_node_ids,
+                evaluation_name='Few-Shot-Finetuned-QuerySet',
+            )
+            adaptation = {
+                'name': 'network', 'selected_features': [], 'C': None,
+                'alpha': None, 'cv_metric': None, 'base_cv_metric': None,
+                'cv_gain': None,
+            }
+            save_path = self.model_path.replace('.pth', '_finetuned.pth')
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'support_node_ids': support_node_ids,
+                'strategy': strategy,
+                'adaptation_mode': self.adaptation_mode,
+                'zero_shot_query_results': zero_shot_query_results,
+                'results': results,
+            }, save_path)
+        print(f"\n Adaptation artifact saved to: {save_path}")
+
+        support_hash = hashlib.sha256(
+            np.asarray(support_node_ids, dtype=np.int64).tobytes()
+        ).hexdigest()[:16]
+        result_row = {
+            'run_name': Path(self.model_path).resolve().parents[1].name,
+            'stage': 'few_shot',
+            'method_version': self.checkpoint.get('config', {}).get(
+                'method_version', 'dipt'
+            ),
+            'adaptation_mode': self.adaptation_mode,
+            'seed': self.seed,
+            'start_year': self.start_year,
+            'end_year': self.end_year,
+            'num_abnormal': self.num_abnormal,
+            'num_normal': self.num_normal,
+            'lambda_fs': self.lambda_fs,
+            'cv_folds': self.cv_folds,
+            'min_cv_gain': self.min_cv_gain,
+            'zero_auc_query': zero_shot_query_results['auc'],
+            'zero_ap_query': zero_shot_query_results['ap'],
+            'auc': results['auc'],
+            'ap': results['ap'],
+            'delta_auc': results['auc'] - zero_shot_query_results['auc'],
+            'delta_ap': results['ap'] - zero_shot_query_results['ap'],
+            'query_samples': len(results['labels']),
+            'query_positives': int(np.asarray(results['labels']).sum()),
+            'selected_readout': adaptation['name'],
+            'selected_features': '|'.join(adaptation['selected_features']),
+            'selected_c': adaptation['C'],
+            'selected_alpha': adaptation['alpha'],
+            'support_cv_metric': adaptation['cv_metric'],
+            'support_cv_gain': adaptation['cv_gain'],
+            'support_hash': support_hash,
+            'evaluation_protocol': (
+                'support-only model selection; disjoint labeled query nodes'
+            ),
+            'checkpoint': save_path,
+        }
+        upsert_csv_row(
+            self.results_csv, result_row,
+            key_fields=(
+                'run_name', 'stage', 'adaptation_mode', 'seed',
+                'num_abnormal', 'num_normal',
+            ),
         )
-        train_loader = DataLoader(
-            dataset, 
-            batch_size=self.batch_size, 
-            shuffle=True, 
-            num_workers=0,
-            collate_fn=few_shot_collate_fn  # Key fix: use custom collate function for sparse matrices
-        )
-        
-        # Fine-tuning training
-        model = self.finetune(model, train_loader)
-        
-        # Evaluation
-        results = self.evaluate(model, test_data, labels, support_node_ids)
-        
-        # Save fine-tuned model
-        save_path = self.model_path.replace('.pth', '_finetuned.pth')
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'support_node_ids': support_node_ids,
-            'strategy': strategy,
-            'results': results
-        }, save_path)
-        print(f"\n Fine-tuned model saved to: {save_path}")
         
         return model, results
 
 
-def find_latest_checkpoint(checkpoint_dir='zero_shot/checkpoints'):
-    """Automatically find the latest checkpoint file"""
-    if not os.path.exists(checkpoint_dir):
-        return None
-    
-    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
-    if not checkpoint_files:
-        return None
-    
-    # Sort by modification time, return the latest
-    checkpoint_paths = [os.path.join(checkpoint_dir, f) for f in checkpoint_files]
-    latest_checkpoint = max(checkpoint_paths, key=os.path.getmtime)
-    return latest_checkpoint
-
-
 def main():
-    parser = argparse.ArgumentParser(description='AnomalyGFM Few-Shot Fine-tuning')
-    
-    # Automatically find the latest checkpoint as default
-    default_model_path = find_latest_checkpoint()
-    if default_model_path is None:
-        default_model_path = 'zero_shot/checkpoints/turning_point_epoch_16_batch_0_consistency_0.305305.pth'
-    
-    parser.add_argument('--model_path', type=str, default=default_model_path,
-        help=f'Path to pre-trained model (default: auto-find latest checkpoint)')
+    parser = argparse.ArgumentParser(description='SPAD few-shot adaptation')
+    parser.add_argument('--model_path', type=str, required=True,
+        help='Path to a repaired zero-shot best_source_loss.pth checkpoint')
     parser.add_argument('--start_year', type=int, default=2018, help='Start year (default: 2018)')
     parser.add_argument('--end_year', type=int, default=2022, help='End year (default: 2022)')
     parser.add_argument('--num_abnormal', type=int, default=10, help='Number of abnormal nodes (default: 10)')
@@ -648,6 +1263,19 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4 , help='Learning rate (default: 1e-4)')
     parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs (default: 20)')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size (default: 32)')
+    parser.add_argument('--lambda_fs', type=float, default=0.5)
+    parser.add_argument('--max_neighbors_per_node', type=int, default=100)
+    parser.add_argument(
+        '--adaptation_mode', choices=['score_fusion', 'network'],
+        default='score_fusion',
+    )
+    parser.add_argument('--cv_folds', type=int, default=5)
+    parser.add_argument(
+        '--min_cv_gain', type=float, default=0.05,
+        help='Minimum support-CV gain required to alter the zero-shot ranking',
+    )
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--results_csv', type=str, default='results/few_shot_runs.csv')
     parser.add_argument('--figraph_path', type=str, default='data/FiGraph-main/data/',
         help='FiGraph data path (default: data/FiGraph-main/data/)')
     
@@ -655,13 +1283,18 @@ def main():
     
     # Print used configuration
     print("=" * 60)
-    print(" Fine-tuning Configuration:")
+    print(" Few-Shot Adaptation Configuration:")
     print(f"  Model path: {args.model_path}")
     print(f"  Time range: {args.start_year}-{args.end_year}")
     print(f"  Support set: {args.num_abnormal} abnormal + {args.num_normal} normal")
-    print(f"  Learning rate: {args.learning_rate}")
-    print(f"  Number of epochs: {args.num_epochs}")
-    print(f"  Batch size: {args.batch_size}")
+    if args.adaptation_mode == 'network':
+        print(f"  Learning rate: {args.learning_rate}")
+        print(f"  Number of epochs: {args.num_epochs}")
+        print(f"  Batch size: {args.batch_size}")
+    else:
+        print(f"  Support CV folds: {args.cv_folds}")
+        print(f"  Minimum CV gain: {args.min_cv_gain}")
+    print(f"  Adaptation mode: {args.adaptation_mode}")
     print("=" * 60)
     print()
     
@@ -675,15 +1308,22 @@ def main():
         'learning_rate': args.learning_rate,
         'num_epochs': args.num_epochs,
         'batch_size': args.batch_size,
+        'lambda_fs': args.lambda_fs,
+        'max_neighbors_per_node': args.max_neighbors_per_node,
+        'adaptation_mode': args.adaptation_mode,
+        'cv_folds': args.cv_folds,
+        'min_cv_gain': args.min_cv_gain,
+        'seed': args.seed,
+        'results_csv': args.results_csv,
         'figraph_path': args.figraph_path
     }
     
-    # Run fine-tuning
+    # Run few-shot adaptation
     finetuner = FewShotFinetuner(config)
     model, results = finetuner.run()
     
     print("\n" + "=" * 60)
-    print(" Few-shot fine-tuning completed!")
+    print(" Few-shot adaptation completed!")
     print("=" * 60)
 
 

@@ -1,165 +1,102 @@
-# Single-Prototype Learning for Zero-Shot Anomaly Detection in Dynamic Graphs
+# NEST: Normality-guided learning and evolving-neighborhood scoring for cross-domain dynamic graph anomaly detection
 
 ## Overview
 
-SPAD (a Single-Prototype learning framework for zero-shot Anomaly Detection in dynamic graphs) is a unified framework designed for anomaly node detection in dynamic graphs. This repository implements our research on addressing the dual challenges of label scarcity and continuous structural evolution in dynamic graph anomaly detection.
+NEST is a framework for zero-shot and few-shot anomalous-node detection across dynamic graphs with heterogeneous node attributes. It separates the role of source normality in representation learning from the reference used to score target anomalies: source-domain supervision shapes the encoder, while evolving target neighborhoods provide the comparison context at inference.
 
-![Framework Overview](docs/framework.png)
+The manuscript implementation is available directly on [`main`](https://github.com/YuTong-Cai2001/NEST/tree/main). Existing experiment identifiers retain their historical spelling so that saved checkpoints and result files remain usable. See [RUNNING.md](RUNNING.md) for reproduction commands and [MANUSCRIPT_VERSION.md](MANUSCRIPT_VERSION.md) for the verified code and result provenance.
 
-## Key Features
+## Method
 
-- **Zero-Shot Anomaly Detection**: Can detect anomaly nodes in dynamic graphs without any labeled samples from the target domain
-- **Few-Shot Fine-tuning**: Supports rapid adaptation to target domains through sparse annotations
-- **Temporal Modeling**: Explicitly captures temporal dependencies and structural evolution patterns
-- **Dual-Alignment Mechanism**: Combines self-evolution inconsistency modeling with population-level alignment
+1. **Shared inputs for heterogeneous graphs.** Sixteen distributional attribute descriptors and eight structural-temporal descriptors provide a common 24-dimensional input for DGraphFin and FiGraph.
+2. **Normality-guided representation learning.** A dynamic GNN and a causal TCN are coupled by residual interaction and hierarchical fusion. Source training combines supervised detection, normal-prototype compactness, and a temporal class-mean objective.
+3. **Evolving-neighborhood zero-shot scoring.** The frozen backbone compares normalized target-node states with their contemporaneous neighbor means. Fixed linear recency weights aggregate disagreement across snapshots, and empirical percentile ranks produce graph-relative anomaly scores. Target labels are not used to fit the encoder or the zero-shot scoring rule.
+4. **Support-only few-shot correction.** The zero-shot ranking anchors a bounded correction selected by support-only cross-validation. Candidates include a logistic score readout, a support-prototype readout, and retaining the zero-shot ranking. The backbone remains frozen, and query labels are reserved for evaluation.
 
-## Method Introduction
+The normal prototype is a source representation constraint, not the default target anomaly-scoring reference. Prototype transport and alternative score features remain available for the scoring analyses and support-selected corrections; they are not the default zero-shot score.
 
-SPAD is developed based on two core principles:
+## Manuscript results
 
-1. **Self-Evolution Inconsistency**: Anomaly nodes' evolution directions are inconsistent with their historical self-evolution trajectories
-2. **Global Evolution Inconsistency**: Anomaly nodes are inconsistent with overall population evolution trends
+Results below are means and population standard deviations over seeds 42, 43, and 44 for DGraphFin-to-FiGraph transfer.
 
-The framework explicitly models these principles through:
-- **Temporal Consistency Constraints**: Captures self-evolution inconsistency
-- **Single-Prototype Population Alignment**: Characterizes global evolution inconsistency
+| Evaluation | ROC-AUC | Average precision |
+| --- | --- | --- |
+| Zero-shot main evaluation: 5,132 labeled target nodes | 0.7704 +/- 0.0132 | 0.0926 +/- 0.0114 |
+| Zero-shot reference on the fixed few-shot query set | 0.7665 +/- 0.0146 | 0.0834 +/- 0.0188 |
+| 10-shot correction on the same query set | 0.7700 +/- 0.0136 | 0.0845 +/- 0.0182 |
 
-This approach learns transferable discriminative priors under source domain supervision, enabling effective zero-shot transfer to target domains.
-
-## Performance
-
-| Setting | AUC | AP |
-|---------|-----|-----|
-| Zero-Shot (DGraphFin → FiGraph) | 0.9537 | 0.0180 |
-| Few-Shot Fine-tuning (DGraphFin → FiGraph) | 0.965 | 0.0180 |
-
-*Results on real-world financial datasets (DGraphFin and FiGraph)*
-
-## Project Structure
-
-```
-zero_shot/
-├── anomaly_gfm_complete_model.py    # Main model architecture (AnomalyGFM Temporal GNN)
-├── data_processor.py                # Data loading and preprocessing
-├── few_shot_finetune.py            # Few-shot fine-tuning implementation
-├── model_adapter.py                # Sparse graph model adapter
-├── sparse_graph_utils.py           # Sparse graph processing utilities
-├── train_anomaly_gfm.py            # Main training script (zero-shot)
-├── utils.py                        # Utility functions
-├── cache/                          # Cache directory
-├── checkpoints/                    # Model checkpoints
-└── processed_data/                # Processed datasets
-```
+The main evaluation includes 123 anomalous and 5,009 normal nodes from the final target snapshot. Few-shot evaluation reserves a maximum support pool of 20 anomalous and 100 normal nodes, leaving 5,012 query nodes, including 103 anomalies. The 10-shot setting uses 10 anomalous and 50 normal support nodes. Within each seed, the query set excludes the entire maximum support pool and remains fixed across the 5-, 10-, and 20-shot settings. The zero-shot query reference is therefore recomputed on that reduced evaluation population rather than copied from the main table.
 
 ## Installation
 
-### Requirements
-
-- Python 3.8+
-- PyTorch 1.10+
-- PyTorch Geometric 2.0+
-- SciPy
-- NumPy
-- scikit-learn
-
-### Setup
+Clone the renamed repository; its default `main` branch contains the manuscript implementation:
 
 ```bash
-# Clone the repository
-git clone https://github.com/YuTong-Cai2001/SPAD.git
-cd SPAD
-
-# Install dependencies
-pip install torch torch-geometric scipy numpy scikit-learn
+git clone https://github.com/YuTong-Cai2001/NEST.git
+cd NEST
 ```
 
-## Datasets
+Use Python 3.10 or 3.11. Install a PyTorch build compatible with your CUDA environment, then install the remaining requirements:
 
-### Source Domain: DGraphFin
+```bash
+pip install -r requirements.txt
+python smoke_test.py
+```
 
-DGraphFin is a financial transaction dataset containing temporal graph data with anomaly labels. It contains:
-- Multiple temporal snapshots
-- Node features (17 dimensions)
-- Binary anomaly labels
+Both `single: OK` and `dual: OK` should appear in the smoke-test output. The code uses the existing module and class names, including `AnomalyGFMModel`, for checkpoint compatibility; these identifiers do not refer to a different manuscript method.
 
-### Target Domain: FiGraph
+## Data
 
-FiGraph is another financial dataset with different feature dimensions (772 dimensions) used for zero-shot evaluation. Feature alignment is applied to enable cross-domain transfer.
+- **Source: DGraphFin.** The source has 17-dimensional raw attributes and timestamped interactions. The manuscript uses the existing source sampling and temporal-window construction in the training pipeline.
+- **Target: FiGraph.** The target sequence covers 2018-2022 and has 772-dimensional raw attributes before descriptor construction. Inference uses the observed target graph; ROC-AUC and AP are computed only for final-snapshot nodes whose released label is exactly 0 or 1. Background entities labeled `-1` are not treated as normal examples.
+
+Place the released datasets at the paths expected by `data_processor.py` and the launchers. Raw datasets are not distributed as part of this repository.
 
 ## Usage
 
-### Zero-Shot Detection
+All commands below are run from the repository root (called `ProtoDGAD` in the original local workspace).
 
-Run zero-shot anomaly detection from DGraphFin (source) to FiGraph (target):
+### Zero-shot training and evaluation
 
-```bash
-python zero_shot/train_anomaly_gfm.py --mode dynamic --start_year 2018 --end_year 2022 --epochs 100
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_experiments.ps1 -RunPrefix nest_paper -Seeds 42,43,44 -Epochs 50 -Variants full -SkipFewShot
 ```
 
-**Parameters:**
-- `--mode`: Graph mode (use "dynamic")
-- `--start_year`: Starting year for training data
-- `--end_year`: Ending year for training data
-- `--epochs`: Number of training epochs
+This trains the full model, restores the checkpoint with the lowest source training loss, and evaluates the frozen model on FiGraph. It writes separate checkpoints under `outputs/nest_paper_full_seed*/`. No training is required merely to rename the method.
 
-### Few-Shot Fine-tuning
+### Fixed-query few-shot evaluation
 
-Fine-tune the pre-trained model on target domain with sparse annotations:
+For the retained manuscript checkpoints:
 
-```bash
-python zero_shot/few_shot_finetune.py
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_few_shot_curve.ps1 -CheckpointPrefix spad_ablation_no_reg_seed -Seeds 42,43,44 -Shots 5,10,20
+python validate_few_shot_curve.py
 ```
 
-This script will:
-1. Load the pre-trained checkpoint from zero-shot training
-2. Build a support set with a small number of labeled nodes
-3. Fine-tune the model for rapid target domain adaptation
+For checkpoints produced by the zero-shot command above, use `-CheckpointPrefix nest_paper_full_seed` instead. The launcher keeps the backbone frozen, uses nested support sets, and selects score corrections using support labels only. At five shots, the current protocol retains the zero-shot anchor because correction fitting requires at least 10 anomalous support nodes.
 
-## Key Components
+The separate `few_shot_adapter.py` and its launcher implement an alternative residual-adapter experiment, not the few-shot procedure reported in the current manuscript.
 
-### Model Architecture
+## Main files
 
-The `AnomalyGFMModel` implements:
-- **TemporalConvNet**: Temporal convolution for sequence processing
-- **GraphNeuralNetwork**: Graph structure encoding with residual connections
-- **HierarchicalFusionNetwork**: Multi-level feature fusion
-- **Dual Alignment**: Temporal consistency and prototype alignment
+| File | Purpose |
+| --- | --- |
+| `anomaly_gfm_complete_model.py` | Dynamic GNN, causal TCN, residual interaction, fusion, and source objectives |
+| `data_processor.py` | Graph loading and shared descriptor construction |
+| `train_anomaly_gfm.py` | Source training and zero-shot target evaluation |
+| `few_shot_finetune.py` | Frozen-feature extraction and support-only score correction |
+| `few_shot_curve.py` | Fixed-query, nested-support few-shot evaluation |
+| `evaluate_reference_scoring.py` | Crossed comparison of training compactness and scoring reference |
+| `run_final_component_ablation.py` | Final-objective component-ablation launcher |
+| `validate_few_shot_curve.py` | Checks saved query and support-set consistency |
 
-### Feature Alignment
+## Paper and citation
 
-To enable cross-domain transfer between DGraphFin (17-dim) and FiGraph (772-dim), the framework implements:
-- **SVD-based alignment**: Projects features to a common space
-- **Linear projection**: Learns domain-invariant representations
+Paper title: **NEST: Normality-guided learning and evolving-neighborhood scoring for cross-domain dynamic graph anomaly detection**.
 
-### Loss Functions
+Authors: Yutong Cai, Xiang Feng, and Huiqun Yu. Publication details will be added when available.
 
-- **Prototype Contrastive Loss**: Learns discriminative prototypes
-- **Temporal Consistency Loss**: Ensures smooth temporal evolution
-- **Residual Regularization**: Promotes representation diversity
+## License and contact
 
-## Main Contributions
-
-1. **Unified Framework**: First unified framework for zero-shot/few-shot anomaly detection in dynamic graphs
-
-2. **Dual-Alignment Design**: Novel temporal graph representation learning with dual-alignment constraints
-   - Temporal consistency constraints
-   - Single-prototype population alignment
-
-3. **Theoretical Foundation**: Strong theoretical support with proof of effectiveness
-
-4. **Practical Applicability**: Efficient and practical technical pathway for industrial-level dynamic graph anomaly detection
-
-## Citation
-
-If you use this code or method in your research, please cite our paper once published:
-
-*To be updated after paper publication.*
-
-## License
-
-This project is licensed under the MIT License.
-
-## Contact
-
-For questions or issues, please open an issue on GitHub or contact the authors.
+This project is licensed under the MIT License. For questions, please open an issue in the [NEST repository](https://github.com/YuTong-Cai2001/NEST).
 
