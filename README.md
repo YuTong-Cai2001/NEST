@@ -25,7 +25,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run_experiments.ps1 -Seeds
 Checkpoints are written to `outputs/nest_paper_full_seed*/`. Evaluate fixed-query few-shot correction with those checkpoints:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_few_shot_curve.ps1 -Seeds 42,43,44 -Shots 5,10,20
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_few_shot_curve.ps1 -Seeds 42,43,44 -Shots 5,10,15,20 -NormalMultipliers 1,2,3,5
 ```
 
 New measurements are written under `results/reproduced/`. Omitting `-SkipFewShot` in the training command runs the fixed-query few-shot evaluation after each full-model run. The training launcher also supports the paper's component variants: `svd_alignment,no_descriptors,no_residual,no_self,no_proto,dual`.
@@ -34,7 +34,7 @@ The same core entry points can be run directly in any shell; this example uses s
 
 ```bash
 python train_anomaly_gfm.py --mode dynamic --epochs 50 --batch_size 1 --sequence_length 5 --seed 42 --run_name nest_paper_full_seed42 --results_csv results/reproduced/zero_shot_runs.csv
-python few_shot_curve.py --model_path outputs/nest_paper_full_seed42/checkpoints/best_source_loss.pth --seed 42 --shots 5,10,20 --results_csv results/reproduced/few_shot_curve_runs.csv
+python few_shot_curve.py --model_path outputs/nest_paper_full_seed42/checkpoints/best_source_loss.pth --seed 42 --shots 5,10,15,20 --normal_multipliers 1,2,3,5 --results_csv results/reproduced/few_shot_grid_runs.csv
 ```
 
 ## Core files
@@ -49,6 +49,8 @@ python few_shot_curve.py --model_path outputs/nest_paper_full_seed42/checkpoints
 | `summarize_few_shot_curve.py` | Mean and population standard deviation of few-shot results |
 
 Existing class names and experiment keys are retained for checkpoint compatibility.
+
+The current evaluation attempts support-only correction at every requested shot count, including five shots. Support-only cross-validation can select the unchanged zero-shot ranking. Different support ratios have separate result keys and separate aggregates; the zero-shot reference is summarized once per seed. New artifacts are saved beside the new result CSV, rather than overwriting artifacts beside the source checkpoint. The archived paper-result CSVs below retain the earlier protocol until a manuscript update is approved.
 
 ## Paper results
 

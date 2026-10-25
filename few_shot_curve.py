@@ -1,4 +1,4 @@
-"""Run a fixed-query, nested-support few-shot curve for SPAD."""
+"""Run fixed-query NEST few-shot curves across shot counts and support ratios."""
 
 import argparse
 import hashlib
@@ -27,6 +27,13 @@ def short_hash(node_ids: Iterable[int]) -> str:
     return hashlib.sha256(values.tobytes()).hexdigest()[:16]
 
 
+def parse_ratios(value: str) -> list[int]:
+    ratios = sorted({int(item.strip()) for item in value.split(',') if item.strip()})
+    if not ratios or ratios[0] < 1:
+        raise ValueError('normal multipliers must contain integers >= 1')
+    return ratios
+
+
 def nested_support(
     pool_node_ids: np.ndarray,
     labels: np.ndarray,
@@ -49,37 +56,35 @@ def nested_support(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='SPAD fixed-query nested-support few-shot curve'
+        description='NEST fixed-query nested-support few-shot curves'
     )
     parser.add_argument('--model_path', required=True)
-    parser.add_argument('--shots', default='5,10,20')
+    parser.add_argument('--shots', default='5,10,15,20')
     parser.add_argument('--normal_multiplier', type=int, default=5)
+    parser.add_argument('--normal_multipliers', default=None,
+                        help='Comma-separated normal/abnormal ratios; overrides normal_multiplier')
     parser.add_argument('--max_support_abnormal', type=int, default=20)
     parser.add_argument('--max_support_normal', type=int, default=100)
-    parser.add_argument(
-        '--min_adaptation_abnormal', type=int, default=10,
-        help=(
-            'Minimum abnormal support count required to fit a correction; '
-            'smaller settings retain the zero-shot ranking'
-        ),
-    )
     parser.add_argument('--start_year', type=int, default=2018)
     parser.add_argument('--end_year', type=int, default=2022)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--cv_folds', type=int, default=5)
     parser.add_argument('--min_cv_gain', type=float, default=0.05)
     parser.add_argument(
-        '--results_csv', default='results/few_shot_curve_runs.csv'
+        '--results_csv', default='results/reproduced/few_shot_grid_runs.csv'
     )
+    parser.add_argument('--output_dir', default=None,
+                        help='Artifact directory; defaults to a directory beside the result CSV')
     parser.add_argument(
         '--figraph_path', default='data/FiGraph-main/data/'
     )
     args = parser.parse_args()
 
     shots = parse_shots(args.shots)
+    ratios = parse_ratios(args.normal_multipliers or str(args.normal_multiplier))
     if max(shots) > args.max_support_abnormal:
         raise ValueError('Largest shot exceeds max_support_abnormal')
-    if max(shots) * args.normal_multiplier > args.max_support_normal:
+    if max(shots) * max(ratios) > args.max_support_normal:
         raise ValueError('Largest normal support exceeds max_support_normal')
 
     config = {
@@ -87,7 +92,7 @@ def main():
         'start_year': args.start_year,
         'end_year': args.end_year,
         'num_abnormal': max(shots),
-        'num_normal': max(shots) * args.normal_multiplier,
+        'num_normal': max(shots) * max(ratios),
         'adaptation_mode': 'score_fusion',
         'cv_folds': args.cv_folds,
         'min_cv_gain': args.min_cv_gain,
@@ -98,10 +103,11 @@ def main():
     finetuner = FewShotFinetuner(config)
 
     print('=' * 68)
-    print(' SPAD Fixed-Query Few-Shot Curve')
+    print(' NEST Fixed-Query Few-Shot Curves')
     print(f'  checkpoint: {args.model_path}')
     print(f'  seed: {args.seed}')
     print(f'  shots: {shots}')
+    print(f'  normal/abnormal ratios: {ratios}')
     print(
         f'  fixed support pool: {args.max_support_abnormal} abnormal + '
         f'{args.max_support_normal} normal'
@@ -138,116 +144,99 @@ def main():
 
     checkpoint = finetuner.checkpoint
     run_name = Path(args.model_path).resolve().parents[1].name
+    artifact_dir = (
+        Path(args.output_dir) if args.output_dir else
+        Path(args.results_csv).parent / 'few_shot_artifacts' / run_name / f'seed{args.seed}'
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     for shot in shots:
-        num_normal = shot * args.normal_multiplier
-        support_node_ids = nested_support(
-            evaluation_pool_ids, labels, shot, num_normal
-        )
-        if shot < args.min_adaptation_abnormal:
-            adapted_scores = score_features[:, 0].copy()
-            adaptation = {
-                'name': 'zero_shot_recency',
-                'indices': [0],
-                'representation': None,
-                'C': None,
-                'alpha': 0.0,
-                'cv_metric': None,
-                'base_cv_metric': None,
-                'cv_gain': 0.0,
-                'coef': [1.0],
-                'intercept': 0.0,
-                'selected_features': [feature_names[0]],
-                'fallback_reason': (
-                    f'num_abnormal<{args.min_adaptation_abnormal}'
-                ),
-            }
-        else:
+        for ratio in ratios:
+            num_normal = shot * ratio
+            support_node_ids = nested_support(
+                evaluation_pool_ids, labels, shot, num_normal
+            )
+            # Every requested shot count fits candidates. Support-only CV may
+            # still retain the zero-shot anchor; there is no shot-count gate.
             adapted_scores, adaptation = finetuner.fit_score_fusion(
                 score_features, feature_names, representations,
                 labels, support_node_ids,
             )
-        results = finetuner.evaluate_score_array(
-            adapted_scores, labels, evaluation_pool_ids,
-            evaluation_name=(
-                f'Few-Shot-Curve-{shot}A-{num_normal}N-FixedQuery'
-            ),
-        )
+            results = finetuner.evaluate_score_array(
+                adapted_scores, labels, evaluation_pool_ids,
+                evaluation_name=f'Few-Shot-{shot}A-{num_normal}N-FixedQuery',
+            )
+            artifact_path = artifact_dir / f'fewshot_{shot}a_{num_normal}n.pth'
+            torch.save({
+                'source_checkpoint': args.model_path,
+                'support_node_ids': support_node_ids,
+                'evaluation_pool_ids': evaluation_pool_ids,
+                'support_pool_strategy': pool_strategy,
+                'support_pool_hash': pool_hash,
+                'support_hash': short_hash(support_node_ids),
+                'adaptation_mode': 'score_fusion',
+                'adaptation': adaptation,
+                'score_feature_names': feature_names,
+                'zero_shot_query_results': zero_results,
+                'results': results,
+            }, artifact_path)
 
-        source_path = Path(args.model_path)
-        artifact_path = source_path.with_name(
-            f'{source_path.stem}_fewshot_curve_{shot}a_{num_normal}n.pth'
-        )
-        torch.save({
-            'source_checkpoint': str(source_path),
-            'support_node_ids': support_node_ids,
-            'evaluation_pool_ids': evaluation_pool_ids,
-            'support_pool_strategy': pool_strategy,
-            'support_pool_hash': pool_hash,
-            'support_hash': short_hash(support_node_ids),
-            'adaptation_mode': 'score_fusion',
-            'adaptation': adaptation,
-            'score_feature_names': feature_names,
-            'zero_shot_query_results': zero_results,
-            'results': results,
-        }, artifact_path)
-
-        row = {
-            'run_name': run_name,
-            'stage': 'few_shot_curve',
-            'method_version': checkpoint.get('config', {}).get(
-                'method_version', 'dipt'
-            ),
-            'adaptation_mode': 'score_fusion',
-            'seed': args.seed,
-            'shot': shot,
-            'num_abnormal': shot,
-            'num_normal': num_normal,
-            'normal_multiplier': args.normal_multiplier,
-            'max_support_abnormal': args.max_support_abnormal,
-            'max_support_normal': args.max_support_normal,
-            'cv_folds': args.cv_folds,
-            'min_cv_gain': args.min_cv_gain,
-            'min_adaptation_abnormal': args.min_adaptation_abnormal,
-            'adaptation_eligible': shot >= args.min_adaptation_abnormal,
-            'start_year': args.start_year,
-            'end_year': args.end_year,
-            'zero_auc_query': zero_results['auc'],
-            'zero_ap_query': zero_results['ap'],
-            'auc': results['auc'],
-            'ap': results['ap'],
-            'delta_auc': results['auc'] - zero_results['auc'],
-            'delta_ap': results['ap'] - zero_results['ap'],
-            'query_samples': len(results['labels']),
-            'query_positives': int(np.asarray(results['labels']).sum()),
-            'selected_readout': adaptation['name'],
-            'selected_features': '|'.join(adaptation['selected_features']),
-            'selected_c': adaptation['C'],
-            'selected_alpha': adaptation['alpha'],
-            'support_cv_metric': adaptation['cv_metric'],
-            'support_cv_gain': adaptation['cv_gain'],
-            'fallback_reason': adaptation.get('fallback_reason', ''),
-            'support_hash': short_hash(support_node_ids),
-            'evaluation_pool_hash': pool_hash,
-            'evaluation_protocol': (
-                'nested support; fixed max-pool-excluded labeled query; '
-                'support-only model selection'
-            ),
-            'checkpoint': str(artifact_path),
-        }
-        upsert_csv_row(
-            args.results_csv,
-            row,
-            key_fields=(
-                'run_name', 'stage', 'adaptation_mode', 'seed',
-                'shot', 'max_support_abnormal', 'max_support_normal',
-            ),
-        )
-        print(
-            f"shot={shot}: AUC {zero_results['auc']:.6f} -> "
-            f"{results['auc']:.6f}; AP {zero_results['ap']:.6f} -> "
-            f"{results['ap']:.6f}; readout={adaptation['name']}"
-        )
-
+            row = {
+                'run_name': run_name,
+                'stage': 'few_shot_curve',
+                'method_version': checkpoint.get('config', {}).get('method_version', 'dipt'),
+                'adaptation_mode': 'score_fusion',
+                'seed': args.seed,
+                'shot': shot,
+                'num_abnormal': shot,
+                'num_normal': num_normal,
+                'normal_multiplier': ratio,
+                'max_support_abnormal': args.max_support_abnormal,
+                'max_support_normal': args.max_support_normal,
+                'cv_folds': args.cv_folds,
+                'min_cv_gain': args.min_cv_gain,
+                'adaptation_attempted': True,
+                'start_year': args.start_year,
+                'end_year': args.end_year,
+                'zero_auc_query': zero_results['auc'],
+                'zero_ap_query': zero_results['ap'],
+                'auc': results['auc'],
+                'ap': results['ap'],
+                'delta_auc': results['auc'] - zero_results['auc'],
+                'delta_ap': results['ap'] - zero_results['ap'],
+                'query_samples': len(results['labels']),
+                'query_positives': int(np.asarray(results['labels']).sum()),
+                'selected_readout': adaptation['name'],
+                'selected_features': '|'.join(adaptation['selected_features']),
+                'selected_c': adaptation['C'],
+                'selected_alpha': adaptation['alpha'],
+                'support_base_cv_metric': adaptation['base_cv_metric'],
+                'support_cv_metric': adaptation['cv_metric'],
+                'support_cv_gain': adaptation['cv_gain'],
+                'fallback_reason': (
+                    'support_cv_selected_zero_shot'
+                    if adaptation['name'] == 'zero_shot_recency' else ''
+                ),
+                'support_hash': short_hash(support_node_ids),
+                'evaluation_pool_hash': pool_hash,
+                'evaluation_protocol': (
+                    'nested support; fixed max-pool-excluded labeled query; '
+                    'support-only model selection; no shot-count gate'
+                ),
+                'checkpoint': str(artifact_path),
+            }
+            upsert_csv_row(
+                args.results_csv, row,
+                key_fields=(
+                    'run_name', 'stage', 'adaptation_mode', 'seed', 'shot',
+                    'normal_multiplier', 'max_support_abnormal', 'max_support_normal',
+                ),
+            )
+            print(
+                f"shot={shot}, normal:abnormal={ratio}:1: "
+                f"AUC {zero_results['auc']:.6f} -> {results['auc']:.6f}; "
+                f"AP {zero_results['ap']:.6f} -> {results['ap']:.6f}; "
+                f"readout={adaptation['name']}"
+            )
 
 if __name__ == '__main__':
     main()

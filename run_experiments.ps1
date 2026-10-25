@@ -119,15 +119,14 @@ foreach ($seed in $seedValues) {
         Invoke-CheckedPython -Arguments @(
             "few_shot_curve.py",
             "--model_path", $checkpoint,
-            "--shots", "5,10,20",
-            "--normal_multiplier", "5",
+            "--shots", "5,10,15,20",
+            "--normal_multipliers", "1,2,3,5",
             "--max_support_abnormal", "20",
             "--max_support_normal", "100",
-            "--min_adaptation_abnormal", "10",
             "--start_year", "$StartYear",
             "--end_year", "$EndYear",
             "--seed", "$seed",
-            "--results_csv", "results/reproduced/few_shot_curve_runs.csv"
+            "--results_csv", "results/reproduced/few_shot_grid_runs.csv"
         )
     }
 }
@@ -135,7 +134,7 @@ foreach ($seed in $seedValues) {
 if ((-not $SkipFewShot) -and ($variantValues -contains "full")) {
     Invoke-CheckedPython -Arguments @(
         "summarize_few_shot_curve.py",
-        "--input", "results/reproduced/few_shot_curve_runs.csv",
-        "--output", "results/reproduced/few_shot_curve_mean_std.csv"
+        "--input", "results/reproduced/few_shot_grid_runs.csv",
+        "--output", "results/reproduced/few_shot_grid_mean_std.csv"
     )
 }

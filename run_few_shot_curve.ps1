@@ -1,16 +1,15 @@
 param(
     [string]$PythonExecutable = "",
     [string]$Seeds = "42,43,44",
-    [string]$Shots = "5,10,20",
-    [int]$NormalMultiplier = 5,
+    [string]$Shots = "5,10,15,20",
+    [string]$NormalMultipliers = "1,2,3,5",
     [int]$MaxSupportAbnormal = 20,
     [int]$MaxSupportNormal = 100,
-    [int]$MinAdaptationAbnormal = 10,
     [int]$StartYear = 2018,
     [int]$EndYear = 2022,
     [string]$CheckpointPrefix = "nest_paper_full_seed",
-    [string]$ResultsCsv = "results/reproduced/few_shot_curve_runs.csv",
-    [string]$SummaryCsv = "results/reproduced/few_shot_curve_mean_std.csv",
+    [string]$ResultsCsv = "results/reproduced/few_shot_grid_runs.csv",
+    [string]$SummaryCsv = "results/reproduced/few_shot_grid_mean_std.csv",
     [switch]$DryRun
 )
 
@@ -53,10 +52,9 @@ foreach ($seed in $seedValues) {
         "few_shot_curve.py",
         "--model_path", $checkpoint,
         "--shots", $Shots,
-        "--normal_multiplier", "$NormalMultiplier",
+        "--normal_multipliers", $NormalMultipliers,
         "--max_support_abnormal", "$MaxSupportAbnormal",
         "--max_support_normal", "$MaxSupportNormal",
-        "--min_adaptation_abnormal", "$MinAdaptationAbnormal",
         "--start_year", "$StartYear",
         "--end_year", "$EndYear",
         "--seed", "$seed",
