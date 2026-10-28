@@ -4,9 +4,9 @@ param(
     [int]$Epochs = 50,
     [int]$StartYear = 2018,
     [int]$EndYear = 2022,
-    [string]$RunPrefix = "nest_paper",
+    [string]$RunPrefix = "nest_fullseq_loss",
     [string]$Variants = "full",
-    [string]$ResultsCsv = "results/reproduced/zero_shot_runs.csv",
+    [string]$ResultsCsv = "results/reproduced/fullseq_loss_zero_shot_runs.csv",
     [switch]$SkipFewShot,
     [switch]$DryRun
 )
@@ -60,7 +60,8 @@ foreach ($seed in $seedValues) {
         "--mode", "dynamic",
         "--epochs", "$Epochs",
         "--batch_size", "1",
-        "--sequence_length", "5",
+        "--sequence_length", "0",
+        "--source_protocol", "all_labels",
         "--start_year", "$StartYear",
         "--end_year", "$EndYear",
         "--seed", "$seed",

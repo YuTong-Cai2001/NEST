@@ -7,7 +7,8 @@ param(
     [int]$MaxSupportNormal = 100,
     [int]$StartYear = 2018,
     [int]$EndYear = 2022,
-    [string]$CheckpointPrefix = "nest_paper_full_seed",
+    [string]$CheckpointPrefix = "nest_fullseq_loss_full_seed",
+    [string]$CheckpointName = "best_source_loss.pth",
     [string]$ResultsCsv = "results/reproduced/few_shot_grid_runs.csv",
     [string]$SummaryCsv = "results/reproduced/few_shot_grid_mean_std.csv",
     [switch]$DryRun
@@ -44,7 +45,7 @@ function Invoke-CheckedPython {
 
 $seedValues = @($Seeds.Split(',') | ForEach-Object { [int]$_.Trim() })
 foreach ($seed in $seedValues) {
-    $checkpoint = "outputs/$CheckpointPrefix$seed/checkpoints/best_source_loss.pth"
+    $checkpoint = "outputs/$CheckpointPrefix$seed/checkpoints/$CheckpointName"
     if ((-not $DryRun) -and (-not (Test-Path -LiteralPath $checkpoint))) {
         throw "Checkpoint not found: $checkpoint"
     }

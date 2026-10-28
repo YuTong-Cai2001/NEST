@@ -19,6 +19,7 @@ import pickle
 import argparse
 import csv
 import json
+import hashlib
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -42,6 +43,27 @@ def set_global_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def source_split(labels: np.ndarray, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Same class-stratified 30%/10% split and RNG order as GeneralDyG/GCN."""
+    labels = np.asarray(labels)
+    rng = np.random.default_rng(seed)
+    train_parts, validation_parts = [], []
+    for class_id in (0, 1):
+        indices = np.flatnonzero(labels == class_id)
+        if len(indices) < 5:
+            raise ValueError('Source split requires at least five nodes per class')
+        rng.shuffle(indices)
+        train_end = max(1, int(len(indices) * 0.30))
+        validation_end = max(train_end + 1, int(len(indices) * 0.40))
+        train_parts.append(indices[:train_end])
+        validation_parts.append(indices[train_end:validation_end])
+    train_indices = np.concatenate(train_parts)
+    validation_indices = np.concatenate(validation_parts)
+    rng.shuffle(train_indices)
+    rng.shuffle(validation_indices)
+    return train_indices, validation_indices
 
 
 def upsert_csv_row(path: str, row: Dict, key_fields=('run_name', 'stage', 'seed')):
@@ -162,7 +184,7 @@ class TemporalGraphDataset(Dataset):
     Create temporal feature sequences and corresponding graph snapshot sequences for each node
     """
     
-    def __init__(self, temporal_data: Dict, sequence_length: int = 10, labels: np.ndarray = None):
+    def __init__(self, temporal_data: Dict, sequence_length: int = 0, labels: np.ndarray = None):
         """
         Args:
             temporal_data: temporal data obtained from data_processor
@@ -172,6 +194,8 @@ class TemporalGraphDataset(Dataset):
         self.temporal_sequences = temporal_data['temporal_sequences']
         self.temporal_adjacencies = temporal_data['temporal_adjacencies']
         self.valid_timestamps = temporal_data['valid_timestamps']
+        if sequence_length < 0:
+            raise ValueError('sequence_length must be nonnegative; 0 means all')
         self.sequence_length = sequence_length
         if labels is not None:
             unique_vals = np.unique(labels)
@@ -258,7 +282,13 @@ class AnomalyGFMTrainer:
         self.num_epochs = config.get('num_epochs', 100)
         self.learning_rate = config.get('learning_rate', 1e-3)
         self.batch_size = config.get('batch_size', 4)
-        self.sequence_length = config.get('sequence_length', 10)
+        self.sequence_length = int(config.get('sequence_length', 0))
+        if self.sequence_length < 0:
+            raise ValueError('sequence_length must be nonnegative; 0 means all')
+        self.source_protocol = config.get('source_protocol', 'all_labels')
+        if self.source_protocol not in ('stratified_validation', 'all_labels'):
+            raise ValueError('Unknown source protocol')
+        self.selection_metadata = {}
         
         self.feature_dim = config.get('feature_dim', 17)  
         
@@ -320,7 +350,7 @@ class AnomalyGFMTrainer:
             'alignment_mode': self.config.get('alignment_mode', 'invariant'),
             'dgraphfin_path': self.config.get('dgraphfin_path', 'data/DGraphFin2/'),
             'figraph_path': self.config.get('figraph_path', 'data/FiGraph-main/data/'),
-            'cache_dir': 'cache/',
+            'cache_dir': self.config.get('cache_dir', 'cache/'),
             'enable_cache': True,
             'seed': self.seed,
         }
@@ -411,6 +441,45 @@ class AnomalyGFMTrainer:
             np.arange(dgraphfin_temporal['num_nodes']),
         )
         train_labels = np.asarray(dgraphfin_data['labels'])[selected_node_ids]
+
+        retained_windows = len(dgraphfin_temporal['temporal_sequences'][0])
+        requested_length = self.sequence_length
+        self.sequence_length = (
+            retained_windows if requested_length == 0 else min(requested_length, retained_windows)
+        )
+        self.config['requested_sequence_length'] = requested_length
+        self.config['sequence_length'] = self.sequence_length
+        self.config['retained_source_windows'] = retained_windows
+        self.config['source_protocol'] = self.source_protocol
+        self.source_labels = train_labels.copy()
+        if self.source_protocol == 'stratified_validation':
+            self.source_train_indices, self.source_validation_indices = source_split(
+                train_labels, self.seed
+            )
+            # All graph nodes remain visible, but every label-dependent loss
+            # (classification, prototype, temporal) receives training labels only.
+            train_labels = np.full(train_labels.shape, -1, dtype=np.int64)
+            train_labels[self.source_train_indices] = self.source_labels[self.source_train_indices]
+        else:
+            self.source_train_indices = np.flatnonzero(np.isin(train_labels, (0, 1)))
+            self.source_validation_indices = np.array([], dtype=np.int64)
+        np.savez_compressed(
+            os.path.join(self.output_dir, 'source_split.npz'),
+            selected_node_ids=np.asarray(selected_node_ids, dtype=np.int64),
+            train_indices=self.source_train_indices,
+            validation_indices=self.source_validation_indices,
+            training_labels=train_labels,
+            source_labels=self.source_labels,
+        )
+        self.config['source_train_count'] = len(self.source_train_indices)
+        self.config['source_validation_count'] = len(self.source_validation_indices)
+        self.config['source_split_sha256'] = hashlib.sha256(
+            Path(self.output_dir, 'source_split.npz').read_bytes()
+        ).hexdigest()
+        with open(os.path.join(self.output_dir, 'run_config.json'), 'w', encoding='utf-8') as handle:
+            json.dump(self.config, handle, indent=2)
+        print(f'Source protocol: {self.source_protocol}; windows={self.sequence_length}/{retained_windows}; '
+              f'train={len(self.source_train_indices)}, validation={len(self.source_validation_indices)}')
         
         train_dataset = TemporalGraphDataset(
             dgraphfin_temporal, 
@@ -429,9 +498,10 @@ class AnomalyGFMTrainer:
         )
         
         self.train_loader = train_loader
+        self.train_dataset = train_dataset
         self.train_data = {
             'features': dgraphfin_temporal['temporal_sequences'][0][-1],
-            'labels': train_labels,
+            'labels': self.source_labels,
             'temporal_data': dgraphfin_temporal,
             'dataset': 'DGraphFin-Dynamic'
         }
@@ -506,6 +576,35 @@ class AnomalyGFMTrainer:
         
     
     
+    @torch.no_grad()
+    def evaluate_source_validation(self) -> Dict[str, float]:
+        """Select on source labels only, using NEST's deployed anomaly score."""
+        self.model.eval()
+        # Access the dataset directly: validation must not draw a new training shuffle.
+        features, adjacencies, _, _ = self.train_dataset[0]
+        features = features.unsqueeze(0).to(self.device)
+        graph_sequence = []
+        for adjacency in adjacencies:
+            edge_index, edge_attr = self.sparse_processor.sparse_to_pyg_format(adjacency)
+            graph_sequence.append({
+                'edge_index': edge_index.to(self.device),
+                'edge_attr': edge_attr.to(self.device) if edge_attr is not None else None,
+                'num_nodes': features.shape[2],
+                'format': 'pyg_sparse',
+            })
+        outputs = self.model(features, graph_sequence, features[:, -1])
+        indices = self.source_validation_indices
+        scores = outputs['anomaly_scores'].detach().cpu().numpy().reshape(-1)[indices]
+        labels = self.source_labels[indices]
+        if not np.isfinite(scores).all():
+            raise ValueError('Nonfinite source validation scores')
+        result = {
+            'auc': float(roc_auc_score(labels, scores)),
+            'ap': float(average_precision_score(labels, scores)),
+        }
+        del outputs, graph_sequence, features
+        return result
+
     def evaluate_zero_shot(self) -> Dict[str, float]:
         """
         Evaluate the repaired dynamic-graph zero-shot pipeline.
@@ -597,6 +696,11 @@ class AnomalyGFMTrainer:
                             raise ValueError('Target snapshot has fewer than two valid classes')
                         eval_results = AnomalyGFMDataProcessor.evaluate_ranking_performance(
                             valid_labels, valid_scores, "FiGraph-Dynamic-ZeroShot"
+                        )
+                        np.savez_compressed(
+                            os.path.join(self.output_dir, 'target_predictions.npz'),
+                            scores=anomaly_scores, labels=np.asarray(test_labels),
+                            evaluated_node_ids=np.flatnonzero(valid_mask),
                         )
 
                         diagnostic_scores = {
@@ -750,7 +854,9 @@ class AnomalyGFMTrainer:
         print(f"=" * 60)
         
         best_train_loss = float('inf')
-        best_model_filename = 'best_source_loss.pth'
+        use_validation = self.source_protocol == 'stratified_validation'
+        best_validation_auc = -float('inf')
+        best_model_filename = 'best_source_validation.pth' if use_validation else 'best_source_loss.pth'
         train_history = []
         consistency_loss_history = []  
         consistency_loss_records = []  
@@ -792,13 +898,32 @@ class AnomalyGFMTrainer:
                     }
                     turning_point_saved = True  
             
-            # Select checkpoints exclusively from source-domain training loss.
-            # Target labels are used once, after training, for final reporting.
-            eval_metrics = {}
+            # Source-validation AUC is the only selection metric, matching the
+            # supervised baselines. Strict improvements retain the earliest tie.
+            # The target is evaluated once, after the selected model is restored.
+            eval_metrics = self.evaluate_source_validation() if use_validation else {}
             current_loss = train_metrics['total_loss']
-            if current_loss < best_train_loss:
-                best_train_loss = current_loss
+            improved = (
+                eval_metrics['auc'] > best_validation_auc if use_validation
+                else current_loss < best_train_loss
+            )
+            best_train_loss = min(best_train_loss, current_loss)
+            if improved:
+                if use_validation:
+                    best_validation_auc = eval_metrics['auc']
+                self.selection_metadata = {
+                    'epoch': epoch + 1,
+                    'metric': 'source_validation_auc' if use_validation else 'source_training_loss',
+                    'source_val_auc': eval_metrics.get('auc'),
+                    'source_val_ap': eval_metrics.get('ap'),
+                    'source_training_loss': current_loss,
+                }
                 self.save_model(best_model_filename)
+            if use_validation:
+                print(f"Epoch {epoch + 1:03d}/{self.num_epochs}: "
+                      f"source_val_auc={eval_metrics['auc']:.6f}, "
+                      f"source_val_ap={eval_metrics['ap']:.6f}, "
+                      f"best_epoch={self.selection_metadata['epoch']}", flush=True)
             self.scheduler.step(current_loss)
             
             epoch_time = time.time() - epoch_start_time
@@ -814,6 +939,8 @@ class AnomalyGFMTrainer:
                 'unsupervised_loss': train_metrics.get('unsupervised_loss', 0.0),
                 'auc': eval_metrics.get('auc', 0.0),
                 'ap': eval_metrics.get('ap', 0.0),
+                'source_val_auc': eval_metrics.get('auc'),
+                'source_val_ap': eval_metrics.get('ap'),
                 'time': epoch_time
             }
             train_history.append(epoch_info)
@@ -852,8 +979,9 @@ class AnomalyGFMTrainer:
         
         # Restore the source-selected checkpoint and evaluate the target once.
         best_model_path = os.path.join(self.checkpoint_dir, best_model_filename)
-        checkpoint = torch.load(best_model_path, map_location=self.device)
+        checkpoint = torch.load(best_model_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.selection_metadata = checkpoint['selection_metadata']
         eval_metrics = self.evaluate_zero_shot()
         final_auc = eval_metrics.get('auc', eval_metrics.get('dynamic_auc', 0.0))
         final_ap = eval_metrics.get('ap', eval_metrics.get('dynamic_ap', 0.0))
@@ -872,6 +1000,14 @@ class AnomalyGFMTrainer:
             'lambda_proto': self.lambda_proto,
             'auc': final_auc,
             'ap': final_ap,
+            'source_protocol': self.source_protocol,
+            'source_windows': self.sequence_length,
+            'source_train_count': len(self.source_train_indices),
+            'source_validation_count': len(self.source_validation_indices),
+            'checkpoint_selection': self.selection_metadata['metric'],
+            'source_checkpoint_epoch': self.selection_metadata['epoch'],
+            'source_val_auc': self.selection_metadata['source_val_auc'],
+            'source_val_ap': self.selection_metadata['source_val_ap'],
             'evaluation_protocol': eval_metrics.get(
                 'evaluation_protocol', 'labeled_target_nodes_only'
             ),
@@ -901,6 +1037,7 @@ class AnomalyGFMTrainer:
                     'config': self.config,
                     'resolved_model_config': self.resolved_model_config,
                     'feature_aligner_path': getattr(self, 'feature_aligner_path', None),
+                    'selection_metadata': self.selection_metadata,
         }, save_path)
         
         print(f"   Model Saved: {save_path}")
@@ -1149,7 +1286,12 @@ def main():
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=1, help='Full-graph batch size (must be 1)')
-    parser.add_argument('--sequence_length', type=int, default=8, help='Temporal sequence length')
+    parser.add_argument('--sequence_length', type=int, default=0,
+                        help='Source sequence length; 0 uses all retained windows')
+    parser.add_argument('--source_protocol', choices=['stratified_validation', 'all_labels'],
+                        default='all_labels',
+                        help='30%% train / 10%% validation with source-AUC selection; all_labels reproduces the legacy protocol')
+    parser.add_argument('--cache_dir', default='cache/')
     parser.add_argument('--mode', type=str, default='dynamic', choices=['dynamic'])
     parser.add_argument('--start_year', type=int, default=2018, help='FiGraph start year (dynamic mode)')
     parser.add_argument('--end_year', type=int, default=2022, help='FiGraph end year (dynamic mode)')
@@ -1177,6 +1319,8 @@ def main():
         'learning_rate': args.lr,
         'batch_size': args.batch_size,
         'sequence_length': args.sequence_length,
+        'source_protocol': args.source_protocol,
+        'cache_dir': args.cache_dir,
         'weight_decay': 1e-5,
         'contrastive_weight': 1.0,
         'anomaly_weight': 0.5,
